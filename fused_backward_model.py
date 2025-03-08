@@ -10,6 +10,8 @@ from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, Llama
 from transformers.utils import LossKwargs
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import check_backward_validity, _infer_device_type, _get_autocast_kwargs, _get_device_module, get_device_states, detach_variable
+import time
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
@@ -80,6 +82,7 @@ class CheckpointFunctionForChunkedBackward(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
+        # import debugpy; debugpy.debug_this_thread()
         # Copy the list to avoid modifying original list.
         inputs = list(ctx.inputs)
         tensor_indices = ctx.tensor_indices
@@ -94,12 +97,19 @@ class CheckpointFunctionForChunkedBackward(torch.autograd.Function):
 
         hidden_states_grad = args[0] # unpack args
         num_chunks = hidden_states_grad.size(1) // ctx.chunk_size
+        if hidden_states_grad.size(1) % ctx.chunk_size != 0:
+            num_chunks += 1
         for i in range(num_chunks):
             start = i * ctx.chunk_size
             end = min((i+1)*ctx.chunk_size, hidden_states_grad.size(1))
-            outputs = ctx.run_function(*detached_inputs, chunk_range=(start, end))
+            t1 = time.time()
+            with torch.enable_grad():
+                outputs = ctx.run_function(*detached_inputs, chunk_range=(start, end)) # TODO: make it more elegant
+            print("chunked forward time: ", time.time()-t1)
             hidden_states = outputs[0]
-            torch.autograd.backward(hidden_states, grad_tensors=hidden_states_grad[:, start:end, :])
+            t2 = time.time()
+            torch.autograd.backward(hidden_states, grad_tensors=hidden_states_grad[:, start:end, :].detach())
+            print("chunked backward time: ", time.time()-t1)
 
         grads = tuple(
             inp.grad if isinstance(inp, torch.Tensor) else None
@@ -156,12 +166,14 @@ class FusedDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
+        t1 = time.time()
         if chunk_range is None:
             chunk_range = (0, hidden_states.size(1))
         residual = hidden_states[:, chunk_range[0]:chunk_range[1], :]
 
         hidden_states = self.input_layernorm(hidden_states)
-
+        t2 = time.time()
+        print("input layernorm time: ", t2-t1)
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -175,12 +187,21 @@ class FusedDecoderLayer(nn.Module):
             chunk_range=chunk_range,
             **kwargs,
         )
+        t3 = time.time()
+        print("self attn time: ", t3-t2)
+
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        t4 = time.time()
+        print("post attn layernorm time: ", t4-t3)
+
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-            
+        
+        t5 = time.time()
+        print("mlp time: ", t5-t4)
         # hidden_states = residual + hidden_states
         outputs = (hidden_states,)
 
@@ -244,6 +265,8 @@ class ChunkedAttention(torch.nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
         chunk_range: Optional[Tuple[int, int]] = None,
+        key_states: Optional[torch.Tensor] = None,
+        value_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
@@ -254,14 +277,17 @@ class ChunkedAttention(torch.nn.Module):
         else:
             chunk_startidx, chunk_endidx, chunk_len = 0, q_len, q_len
 
-        # num_chunks = q_len // self.chunk_size
-        # if q_len % self.chunk_size != 0:
-        #     num_chunks += 1
-        
-        # for chunk_idx in range(num_chunks):
+        t1 = time.time()
 
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)            
+        if key_states is None:
+            key_states = self.k_proj(hidden_states)
+            print("k projection time: ", time.time()-t1)
+        if value_states is None:
+            value_states = self.v_proj(hidden_states)
+
+        query_states = self.q_proj(hidden_states[:, chunk_startidx:chunk_endidx, :])
+        t2 = time.time()
+        print("kv projection time: ", t2-t1)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -274,14 +300,13 @@ class ChunkedAttention(torch.nn.Module):
         else:
             cos, sin = position_embeddings
 
-        # query_states = []
+        t3 = time.time()
+        print("rope time: ", t3-t2)
 
-        # chunk_startidx = chunk_idx * self.chunk_size
-        # chunk_endidx = min((chunk_idx+1)*self.chunk_size, q_len)
-        # chunk_len = chunk_endidx - chunk_startidx
-
-        query_states = self.q_proj(hidden_states[:, chunk_startidx:chunk_endidx, :])
         query_states = query_states.view(bsz, chunk_len, -1, self.head_dim).transpose(1, 2)
+
+        t4 = time.time()
+        print("q projection time: ", t4-t3)
 
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
@@ -289,6 +314,8 @@ class ChunkedAttention(torch.nn.Module):
         key_states = apply_rotary_pos_emb(key_states, cos, sin)
         query_states = apply_rotary_pos_emb(query_states, cos[:, chunk_startidx:chunk_endidx], sin[:, chunk_startidx:chunk_endidx])
 
+        t5 = time.time()
+        print("apply rope time: ", t5-t4)
         # TODO: check the meaning of this section
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -317,6 +344,9 @@ class ChunkedAttention(torch.nn.Module):
         is_causal = True if causal_mask is None and q_len > 1 else False
 
         causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :]
+
+        t6 = time.time()
+        print("pre attn time: ", t6-t5)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
@@ -326,9 +356,15 @@ class ChunkedAttention(torch.nn.Module):
             is_causal=is_causal,
         )
 
+        t7 = time.time()
+        print("attn time: ", t7-t6)
+
         attn_output = attn_output.transpose(1, 2).contiguous() # TODO: check
         attn_output = attn_output.view(bsz, chunk_len, -1)
         attn_output = self.o_proj(attn_output)
+
+        t8 = time.time()
+        print("o projection time: ", t8-t7)
 
         return attn_output, None, past_key_value
 
