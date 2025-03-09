@@ -1,6 +1,6 @@
 from transformers import Trainer
 from transformers.modeling_utils import PreTrainedModel
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Any, Dict
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs, _flash_attention_forward
@@ -118,18 +118,22 @@ class CheckpointFunctionForChunkedBackward(torch.autograd.Function):
 
         return (None, None) + grads
 
-class FusedDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+class StreamDecoderLayer(nn.Module):
+    def __init__(self, base_layer):
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.layer_idx = layer_idx
+        self.base_layer = base_layer
+        self._setup_attn()
 
-        # self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
-        self.self_attn = ChunkedAttention(config=config, layer_idx=layer_idx)
+    def _setup_attn(self):
+        """enable stream forward"""
+        self.base_layer.self_attn = StreamAttention(self.base_layer.self_attn)
 
-        self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    def __getattr__(self, name):
+        """inherit attributes"""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_layer, name)
 
     def forward(
         self,
@@ -162,6 +166,7 @@ class FusedDecoderLayer(nn.Module):
             position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
                 Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
                 with `head_dim` being the embedding dimension of each attention head.
+            chunk_range (`Tuple[int, int]`, *optional*): chunk range for calculating query states
             kwargs (`dict`, *optional*):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
@@ -214,44 +219,54 @@ class FusedDecoderLayer(nn.Module):
         return outputs
 
 
-class ChunkedAttention(torch.nn.Module):
+class StreamAttention(torch.nn.Module):
     """
     Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
     `Attention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
     SDPA API.
     """
 
-    def __init__(self, config: LlamaConfig, chunk_size=100, layer_idx: Optional[int] = None):
+    # def __init__(self, config: LlamaConfig, chunk_size=100, layer_idx: Optional[int] = None):
+    #     super().__init__()
+    #     self.config = config
+    #     self.layer_idx = layer_idx
+    #     if layer_idx is None:
+    #         logger.warning_once(
+    #             f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+    #             "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+    #             "when creating this class."
+    #         )
+
+    #     self.attention_dropout = config.attention_dropout
+    #     self.hidden_size = config.hidden_size
+    #     self.num_heads = config.num_attention_heads
+    #     self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
+    #     self.num_key_value_heads = config.num_key_value_heads
+    #     self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+    #     self.max_position_embeddings = config.max_position_embeddings
+    #     self.rope_theta = config.rope_theta
+    #     self.is_causal = True
+
+    #     self.chunk_size = chunk_size
+
+    #     self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+    #     self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    #     self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    #     self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+
+    #     # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
+    #     self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+
+    def __init__(self, self_attn):
         super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-
-        self.attention_dropout = config.attention_dropout
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.is_causal = True
-
-        self.chunk_size = chunk_size
-
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
-
-        # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
-        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
-
+        self.self_attn = self_attn
+    
+    def __getattr__(self, name):
+        """inherit attributes"""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.self_attn, name)
 
     # Adapted from Attention.forward
     def forward(
@@ -369,12 +384,19 @@ class ChunkedAttention(torch.nn.Module):
         return attn_output, None, past_key_value
 
 
-class ChunkedForwardModel(torch.nn.Module):
+class StreamModel(torch.nn.Module):
     def __init__(self, model: PreTrainedModel, chunk_size: int):
         # super().__init__(config)
         super().__init__()
-        self.chunk_size = chunk_size
+        self.logits_chunk_size = chunk_size
         self.model = model
+        self._setup_stream_forward()
+
+    def _setup_stream_forward(self):
+        # TODO: add check for layer type
+        # TODO: avoid modifying the base model's behavior
+        for layer in self.model.model.layers:
+            layer = StreamDecoderLayer(layer)
 
     def __getattr__(self, name):
         """inherit attributes from model"""
@@ -382,6 +404,43 @@ class ChunkedForwardModel(torch.nn.Module):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self.model, name)
+
+    def gradient_checkpointing_enable(self: "PreTrainedModel", gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None):
+        r"""
+        Activates gradient checkpointing for the current model.
+
+        Modification of the original method to enable gradient checkpointing for block-wise optimizer.
+        """
+        # from torch.utils.checkpoint import checkpoint
+
+        if not self.supports_gradient_checkpointing:
+            raise ValueError("{} does not support gradient checkpointing.".format(self.__class__.__name__))
+
+        # if gradient_checkpointing_kwargs is None:
+        #     gradient_checkpointing_kwargs = {"use_reentrant": True}
+
+        # gradient_checkpointing_func = partial(checkpoint, **gradient_checkpointing_kwargs)
+
+        # TODO: check compatibility of use_reentrant
+        gradient_checkpointing_func = CheckpointFunctionForChunkedBackward.apply
+
+        def custom_gradient_checkpointing_func(func, *args, **kwargs):
+            module: "torch.nn.Module" = func.__self__
+
+            if any(param.requires_grad for param in module.parameters()):
+                for arg in args:
+                    if torch.is_tensor(arg) and torch.is_floating_point(arg):
+                        arg.requires_grad_(True)
+
+            return gradient_checkpointing_func(func, *args, **kwargs)
+
+        if "value" in inspect.signature(self._set_gradient_checkpointing).parameters:  # old GC format
+            self.apply(partial(self._set_gradient_checkpointing, value=True))
+            self.enable_input_require_grads()
+            logger.warning("You are using the old GC format, some features (e.g. BAdam) will be invalid.")
+        else:  # have already enabled input require gradients
+            self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=custom_gradient_checkpointing_func)
+
 
     def forward(
         self,
@@ -444,16 +503,18 @@ class ChunkedForwardModel(torch.nn.Module):
         B, T, C = hidden_states.size()
 
         loss = torch.tensor(0., device=hidden_states.device)
-        num_chunks = T // self.chunk_size
+        num_chunks = T // self.logits_chunk_size
+        if T % self.logits_chunk_size != 0:
+            num_chunks += 1
 
         for i in range(num_chunks):
-            start = i * self.chunk_size
-            end = min((i+1)*self.chunk_size, T)
+            start = i * self.logits_chunk_size
+            end = min((i+1)*self.logits_chunk_size+1, T)
             print(start, end)
 
             logits_chunk = model.lm_head(hidden_states[:, start:end, :])
             labels_chunk = labels[:, start:end]
-            valid_position_num = (labels_chunk != -100).sum().item()
+            valid_position_num = (labels_chunk != -100).sum().item() - 1
 
             if valid_position_num == 0:
                 continue
