@@ -9,12 +9,17 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaRMSNorm, repeat_kv, rotate_half
 from transformers.utils import LossKwargs
 import inspect
+import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import check_backward_validity, _infer_device_type, _get_autocast_kwargs, _get_device_module, get_device_states, detach_variable
 import time
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
+
+def print_time(*msg, verbose=0):
+    if verbose > 0:
+        print(msg)
 
 def apply_rotary_pos_emb(states, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -99,20 +104,19 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
         detached_inputs = detach_variable(tuple(inputs))
 
         hidden_states_grad = args[0] # unpack args
-        num_chunks = hidden_states_grad.size(1) // ctx.chunk_size
-        if hidden_states_grad.size(1) % ctx.chunk_size != 0:
-            num_chunks += 1
+        num_chunks = math.ceil(hidden_states_grad.size(1) / ctx.chunk_size)
+
         for i in range(num_chunks):
             start = i * ctx.chunk_size
             end = min((i+1)*ctx.chunk_size, hidden_states_grad.size(1))
             t1 = time.time()
             with torch.enable_grad():
                 outputs = ctx.run_function(*detached_inputs, chunk_range=(start, end)) # TODO: make it more elegant
-            print("chunked forward time: ", time.time()-t1)
+            print_time("chunked forward time: ", time.time()-t1)
             hidden_states = outputs[0]
             t2 = time.time()
             torch.autograd.backward(hidden_states, grad_tensors=hidden_states_grad[:, start:end, :].detach())
-            print("chunked backward time: ", time.time()-t1)
+            print_time("chunked backward time: ", time.time()-t1)
 
         grads = tuple(
             inp.grad if isinstance(inp, torch.Tensor) else None
@@ -181,7 +185,7 @@ class StreamDecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
         t2 = time.time()
-        print("input layernorm time: ", t2-t1)
+        print_time("input layernorm time: ", t2-t1)
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -196,20 +200,20 @@ class StreamDecoderLayer(nn.Module):
             **kwargs,
         )
         t3 = time.time()
-        print("self attn time: ", t3-t2)
+        print_time("self attn time: ", t3-t2)
 
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         t4 = time.time()
-        print("post attn layernorm time: ", t4-t3)
+        print_time("post attn layernorm time: ", t4-t3)
 
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
         t5 = time.time()
-        print("mlp time: ", t5-t4)
+        print_time("mlp time: ", t5-t4)
         # hidden_states = residual + hidden_states
         outputs = (hidden_states,)
 
@@ -228,37 +232,6 @@ class StreamAttention(torch.nn.Module):
     `Attention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
     SDPA API.
     """
-
-    # def __init__(self, config: LlamaConfig, chunk_size=100, layer_idx: Optional[int] = None):
-    #     super().__init__()
-    #     self.config = config
-    #     self.layer_idx = layer_idx
-    #     if layer_idx is None:
-    #         logger.warning_once(
-    #             f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-    #             "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
-    #             "when creating this class."
-    #         )
-
-    #     self.attention_dropout = config.attention_dropout
-    #     self.hidden_size = config.hidden_size
-    #     self.num_heads = config.num_attention_heads
-    #     self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
-    #     self.num_key_value_heads = config.num_key_value_heads
-    #     self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-    #     self.max_position_embeddings = config.max_position_embeddings
-    #     self.rope_theta = config.rope_theta
-    #     self.is_causal = True
-
-    #     self.chunk_size = chunk_size
-
-    #     self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-    #     self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-    #     self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-    #     self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
-
-    #     # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
-    #     self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
     def __init__(self, self_attn):
         super().__init__()
@@ -299,13 +272,13 @@ class StreamAttention(torch.nn.Module):
 
         if key_states is None:
             key_states = self.k_proj(hidden_states)
-            print("k projection time: ", time.time()-t1)
+            print_time("k projection time: ", time.time()-t1)
         if value_states is None:
             value_states = self.v_proj(hidden_states)
 
         query_states = self.q_proj(hidden_states[:, chunk_startidx:chunk_endidx, :])
         t2 = time.time()
-        print("kv projection time: ", t2-t1)
+        print_time("kv projection time: ", t2-t1)
 
         if position_embeddings is None:
             logger.warning_once(
@@ -319,12 +292,12 @@ class StreamAttention(torch.nn.Module):
             cos, sin = position_embeddings
 
         t3 = time.time()
-        print("rope time: ", t3-t2)
+        print_time("rope time: ", t3-t2)
 
         query_states = query_states.view(bsz, chunk_len, -1, self.head_dim).transpose(1, 2)
 
         t4 = time.time()
-        print("q projection time: ", t4-t3)
+        print_time("q projection time: ", t4-t3)
 
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
@@ -333,7 +306,7 @@ class StreamAttention(torch.nn.Module):
         query_states = apply_rotary_pos_emb(query_states, cos[:, chunk_startidx:chunk_endidx], sin[:, chunk_startidx:chunk_endidx])
 
         t5 = time.time()
-        print("apply rope time: ", t5-t4)
+        print_time("apply rope time: ", t5-t4)
         # TODO: check the meaning of this section
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -364,7 +337,7 @@ class StreamAttention(torch.nn.Module):
         causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :]
 
         t6 = time.time()
-        print("pre attn time: ", t6-t5)
+        print_time("pre attn time: ", t6-t5)
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
@@ -375,14 +348,14 @@ class StreamAttention(torch.nn.Module):
         )
 
         t7 = time.time()
-        print("attn time: ", t7-t6)
+        print_time("attn time: ", t7-t6)
 
         attn_output = attn_output.transpose(1, 2).contiguous() # TODO: check
         attn_output = attn_output.view(bsz, chunk_len, -1)
         attn_output = self.o_proj(attn_output)
 
         t8 = time.time()
-        print("o projection time: ", t8-t7)
+        print_time("o projection time: ", t8-t7)
 
         return attn_output, None, past_key_value
 
@@ -514,16 +487,15 @@ class StreamModel(torch.nn.Module):
         B, T, C = hidden_states.size()
 
         loss = torch.tensor(0., device=hidden_states.device)
-        num_chunks = T // self.logits_chunk_size
-        if T % self.logits_chunk_size != 0:
-            num_chunks += 1
+        num_chunks = math.ceil(T / self.logits_chunk_size)
+
+        detached_hidden_states = hidden_states.detach().requires_grad_(True)
 
         for i in range(num_chunks):
             start = i * self.logits_chunk_size
             end = min((i+1)*self.logits_chunk_size+1, T)
-            print(start, end)
 
-            logits_chunk = model.lm_head(hidden_states[:, start:end, :])
+            logits_chunk = model.lm_head(detached_hidden_states[:, start:end, :])
             labels_chunk = labels[:, start:end]
             valid_position_num_chunk = (labels_chunk != -100).sum().item() - 1
 
@@ -531,26 +503,20 @@ class StreamModel(torch.nn.Module):
                 continue
 
             loss_chunk = model.loss_function(logits=logits_chunk, labels=labels_chunk, vocab_size=model.config.vocab_size) * valid_position_num_chunk
-            loss_chunk.backward(inputs=[logits_chunk, hidden_states], retain_graph=True)
- 
-            grad_chunk = logits_chunk.grad.detach().view(-1, model.config.vocab_size).T @ hidden_states[:, start:end, :].view(-1, C).detach()
+            loss_chunk.backward(retain_graph=True if i < num_chunks-1 else False)
 
-            if model.lm_head.weight.grad is None:
-                model.lm_head.weight.grad = logits_chunk.grad.detach().view(-1, model.config.vocab_size).T @ hidden_states[:, start:end, :].view(-1, C).detach()
-            else:
-                model.lm_head.weight.grad.add_(logits_chunk.grad.detach().view(-1, model.config.vocab_size).T @ hidden_states[:, start:end, :].view(-1, C).detach())
             del logits_chunk.grad
             del logits_chunk
             loss += loss_chunk.detach()
 
         # normalize loss and gradient
         valid_position_num = (labels != -100).sum().item()
-        loss /= valid_position_num
-        hidden_states.grad = hidden_states.grad / valid_position_num
-        model.lm_head.weight.grad = model.lm_head.weight.grad / valid_position_num
+        loss.div_(valid_position_num)
+        detached_hidden_states.grad.div_(valid_position_num)
+        model.lm_head.weight.grad.div_(valid_position_num)
 
-        torch.autograd.backward(hidden_states, grad_tensors=hidden_states.grad)
-        hidden_states.grad = None
+        torch.autograd.backward(hidden_states, grad_tensors=detached_hidden_states.grad.detach())
+        detached_hidden_states.grad = None
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -562,5 +528,3 @@ class StreamModel(torch.nn.Module):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-
