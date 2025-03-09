@@ -8,6 +8,7 @@ from transformers.processing_utils import Unpack
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaRMSNorm, repeat_kv, rotate_half
 from transformers.utils import LossKwargs
+import inspect
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import check_backward_validity, _infer_device_type, _get_autocast_kwargs, _get_device_module, get_device_states, detach_variable
@@ -37,7 +38,9 @@ class LlamaMLP(nn.Module):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
-class CheckpointFunctionForChunkedBackward(torch.autograd.Function):
+class CheckpointFunctionForStreamBackward(torch.autograd.Function):
+    chunk_size: int = 100
+
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
         check_backward_validity(args)
@@ -48,7 +51,7 @@ class CheckpointFunctionForChunkedBackward(torch.autograd.Function):
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
             ctx.device
         )
-        ctx.chunk_size = 100 # TODO: make it cleaner
+        ctx.chunk_size = CheckpointFunctionForStreamBackward.chunk_size
         if preserve_rng_state:
             ctx.fwd_cpu_state = torch.get_rng_state()
             # Don't eagerly initialize the cuda context by accident.
@@ -385,18 +388,25 @@ class StreamAttention(torch.nn.Module):
 
 
 class StreamModel(torch.nn.Module):
-    def __init__(self, model: PreTrainedModel, chunk_size: int):
-        # super().__init__(config)
+    def __init__(self, model: PreTrainedModel, logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
+        """ The StreamModel class wraps the original model to save the memory usage. """
         super().__init__()
-        self.logits_chunk_size = chunk_size
+        self.logits_chunk_size = logits_chunk_size
         self.model = model
+
+        # enable transformer layer to forward in chunk mode, i.e. calculate the query states
+        # of a particular chunk (NOTE: the key and value states are still calculated for the whole sequence)
         self._setup_stream_forward()
+
+        if stream_checkpoint:
+            # when calculating the gradient for checkpointed layer, re-forward and backward in stream mode
+            self.gradient_checkpointing_enable(checkpoint_chunk_size=checkpoint_chunk_size)
 
     def _setup_stream_forward(self):
         # TODO: add check for layer type
         # TODO: avoid modifying the base model's behavior
-        for layer in self.model.model.layers:
-            layer = StreamDecoderLayer(layer)
+        for i in range(len(self.model.model.layers)):
+            self.model.model.layers[i] = StreamDecoderLayer(self.model.model.layers[i])
 
     def __getattr__(self, name):
         """inherit attributes from model"""
@@ -405,13 +415,14 @@ class StreamModel(torch.nn.Module):
         except AttributeError:
             return getattr(self.model, name)
 
-    def gradient_checkpointing_enable(self: "PreTrainedModel", gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None):
+    def gradient_checkpointing_enable(self: "PreTrainedModel", gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None, checkpoint_chunk_size: int = 500):
         r"""
         Activates gradient checkpointing for the current model.
 
         Modification of the original method to enable gradient checkpointing for block-wise optimizer.
         """
         # from torch.utils.checkpoint import checkpoint
+        from functools import partial
 
         if not self.supports_gradient_checkpointing:
             raise ValueError("{} does not support gradient checkpointing.".format(self.__class__.__name__))
@@ -421,8 +432,10 @@ class StreamModel(torch.nn.Module):
 
         # gradient_checkpointing_func = partial(checkpoint, **gradient_checkpointing_kwargs)
 
-        # TODO: check compatibility of use_reentrant
-        gradient_checkpointing_func = CheckpointFunctionForChunkedBackward.apply
+        # TODO: handle the argument of use_reentrant
+        CheckpointFunctionForStreamBackward.chunk_size = checkpoint_chunk_size
+
+        gradient_checkpointing_func = CheckpointFunctionForStreamBackward.apply
 
         def custom_gradient_checkpointing_func(func, *args, **kwargs):
             module: "torch.nn.Module" = func.__self__
@@ -432,15 +445,13 @@ class StreamModel(torch.nn.Module):
                     if torch.is_tensor(arg) and torch.is_floating_point(arg):
                         arg.requires_grad_(True)
 
-            return gradient_checkpointing_func(func, *args, **kwargs)
+            return gradient_checkpointing_func(func, True, *args, **kwargs) # TODO: handle the argument of preserve_rng_state
 
         if "value" in inspect.signature(self._set_gradient_checkpointing).parameters:  # old GC format
             self.apply(partial(self._set_gradient_checkpointing, value=True))
             self.enable_input_require_grads()
-            logger.warning("You are using the old GC format, some features (e.g. BAdam) will be invalid.")
         else:  # have already enabled input require gradients
             self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=custom_gradient_checkpointing_func)
-
 
     def forward(
         self,
@@ -514,18 +525,29 @@ class StreamModel(torch.nn.Module):
 
             logits_chunk = model.lm_head(hidden_states[:, start:end, :])
             labels_chunk = labels[:, start:end]
-            valid_position_num = (labels_chunk != -100).sum().item() - 1
+            valid_position_num_chunk = (labels_chunk != -100).sum().item() - 1
 
-            if valid_position_num == 0:
+            if valid_position_num_chunk == 0:
                 continue
 
-            loss_chunk = model.loss_function(logits=logits_chunk, labels=labels_chunk, vocab_size=model.config.vocab_size) * valid_position_num
-            loss_chunk.backward(inputs=[hidden_states], retain_graph=True)
+            loss_chunk = model.loss_function(logits=logits_chunk, labels=labels_chunk, vocab_size=model.config.vocab_size) * valid_position_num_chunk
+            loss_chunk.backward(inputs=[logits_chunk, hidden_states], retain_graph=True)
+ 
+            grad_chunk = logits_chunk.grad.detach().view(-1, model.config.vocab_size).T @ hidden_states[:, start:end, :].view(-1, C).detach()
+
+            if model.lm_head.weight.grad is None:
+                model.lm_head.weight.grad = logits_chunk.grad.detach().view(-1, model.config.vocab_size).T @ hidden_states[:, start:end, :].view(-1, C).detach()
+            else:
+                model.lm_head.weight.grad.add_(logits_chunk.grad.detach().view(-1, model.config.vocab_size).T @ hidden_states[:, start:end, :].view(-1, C).detach())
+            del logits_chunk.grad
+            del logits_chunk
             loss += loss_chunk.detach()
 
         # normalize loss and gradient
-        loss /= (labels != -100).sum().item()
-        hidden_states.grad = hidden_states.grad / (labels != -100).sum().item()
+        valid_position_num = (labels != -100).sum().item()
+        loss /= valid_position_num
+        hidden_states.grad = hidden_states.grad / valid_position_num
+        model.lm_head.weight.grad = model.lm_head.weight.grad / valid_position_num
 
         torch.autograd.backward(hidden_states, grad_tensors=hidden_states.grad)
         hidden_states.grad = None
