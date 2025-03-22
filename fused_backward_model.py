@@ -14,12 +14,17 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import check_backward_validity, _infer_device_type, _get_autocast_kwargs, _get_device_module, get_device_states, detach_variable
 import time
+import gc
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
-def print_time(*msg, verbose=0):
+verbose=1
+selected_group = "Checkpoint"
+def print_time(*msg, group=""):
+    if selected_group is not None and group != selected_group:
+        return
     if verbose > 0:
-        print(msg)
+        print(f"[{group}]:", *msg)
 
 def apply_rotary_pos_emb(states, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -45,7 +50,6 @@ class LlamaMLP(nn.Module):
 
 class CheckpointFunctionForStreamBackward(torch.autograd.Function):
     chunk_size: int = 100
-
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
         check_backward_validity(args)
@@ -106,24 +110,165 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
         hidden_states_grad = args[0] # unpack args
         num_chunks = math.ceil(hidden_states_grad.size(1) / ctx.chunk_size)
 
+        forward_time = 0
+        backward_time = 0
         for i in range(num_chunks):
             start = i * ctx.chunk_size
             end = min((i+1)*ctx.chunk_size, hidden_states_grad.size(1))
             t1 = time.time()
+            # torch.cuda.memory._record_memory_history(max_entries=1000000)
             with torch.enable_grad():
                 outputs = ctx.run_function(*detached_inputs, chunk_range=(start, end)) # TODO: make it more elegant
-            print_time("chunked forward time: ", time.time()-t1)
+            forward_time += time.time() - t1
+            # print_time(f"chunked forward time {i+1}/{num_chunks}: ", time.time()-t1, group="Checkpoint")
             hidden_states = outputs[0]
             t2 = time.time()
-            torch.autograd.backward(hidden_states, grad_tensors=hidden_states_grad[:, start:end, :].detach())
-            print_time("chunked backward time: ", time.time()-t1)
+            torch.autograd.backward(
+                    hidden_states,
+                    grad_tensors=hidden_states_grad[:, start:end, :].detach(), 
+                    retain_graph=True if end < hidden_states_grad.size(1) else False # TODO: should be avoided
+                )
+
+            # torch.cuda.memory._dump_snapshot(f"test_data_model/memory_record_checkpoint.pickle")
+            # torch.cuda.memory._record_memory_history(enabled=None)
+            backward_time += time.time() - t2
+            # print_time(f"chunked backward time {i+1}/{num_chunks}: ", time.time()-t2, group="Checkpoint")
 
         grads = tuple(
             inp.grad if isinstance(inp, torch.Tensor) else None
             for inp in detached_inputs
-        )
+        ) # TODO: check why this line reduces memory
 
+        print_time(f"forward time: {forward_time}", group="Checkpoint")
+        print_time(f"backward time: {backward_time}", group="Checkpoint")
         return (None, None) + grads
+
+class StreamMLP(nn.Module):
+    def __init__(self, mlp):
+        self.mlp = mlp
+
+    def __getattr__(self, name):
+        """inherit attributes"""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.mlp, name)
+
+    def forward(self, x, chunk_range=None):
+        if chunk_range is not None:
+            x = x[:, chunk_range[0]:chunk_range[1], :]
+        down_proj = self.mlp(x)
+        return down_proj
+
+class StreamDecoderLayer_v2(nn.Module):
+    def __init__(self, base_layer):
+        super().__init__()
+        self.base_layer = base_layer
+        self._setup_attn()
+        self._setup_mlp()
+
+    def _setup_attn(self):
+        """enable stream forward"""
+        self.base_layer.self_attn = StreamAttention(self.base_layer.self_attn)
+        # self.base_layer.self_attn = CheckpointFunctionForStreamBackward(self.base_layer.self_attn)
+
+    def _setup_mlp(self):
+        self.base_layer.mlp = StreamMLP(self.base_layer.mlp)
+
+    def __getattr__(self, name):
+        """inherit attributes"""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_layer, name)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        # chunk_range: Optional[Tuple[int, int]] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.FloatTensor`, *optional*):
+                attention mask of size `(batch_size, sequence_length)` if flash attention is used or `(batch_size, 1,
+                query_sequence_length, key_sequence_length)` if default attention is used.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+            use_cache (`bool`, *optional*):
+                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
+                (see `past_key_values`).
+            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+                Indices depicting the position of the input sequence tokens in the sequence
+            position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
+                Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
+                with `head_dim` being the embedding dimension of each attention head.
+            kwargs (`dict`, *optional*):
+                Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
+                into the model
+        """
+        t1 = time.time()
+
+        residual = hidden_states
+        
+        # if chunk_range is not None:
+        #     residual = hidden_states[:, chunk_range[0]:chunk_range[1], :]
+
+        hidden_states = self.input_layernorm(hidden_states)
+        t2 = time.time()
+        print_time("input layernorm: ", t2-t1, group="DecoderLayer")
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = CheckpointFunctionForStreamBackward.apply(
+            self.self_attn.__call__,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        t3 = time.time()
+        print_time("self attn: ", t3-t2, group="DecoderLayer")
+
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        t4 = time.time()
+        print_time("post attn layernorm: ", t4-t3, group="DecoderLayer")
+
+        hidden_states = CheckpointFunctionForStreamBackward.apply(
+            self.mlp.__call__,
+            hidden_states=hidden_states,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+        
+        t5 = time.time()
+        print_time("mlp: ", t5-t4, group="DecoderLayer")
+        # hidden_states = residual + hidden_states
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        return outputs
 
 class StreamDecoderLayer(nn.Module):
     def __init__(self, base_layer):
@@ -179,13 +324,15 @@ class StreamDecoderLayer(nn.Module):
                 into the model
         """
         t1 = time.time()
-        if chunk_range is None:
-            chunk_range = (0, hidden_states.size(1))
-        residual = hidden_states[:, chunk_range[0]:chunk_range[1], :]
+
+        residual = hidden_states
+        
+        if chunk_range is not None:
+            residual = hidden_states[:, chunk_range[0]:chunk_range[1], :]
 
         hidden_states = self.input_layernorm(hidden_states)
         t2 = time.time()
-        print_time("input layernorm time: ", t2-t1)
+        print_time("input layernorm: ", t2-t1, group="DecoderLayer")
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -200,20 +347,20 @@ class StreamDecoderLayer(nn.Module):
             **kwargs,
         )
         t3 = time.time()
-        print_time("self attn time: ", t3-t2)
+        print_time("self attn: ", t3-t2, group="DecoderLayer")
 
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         t4 = time.time()
-        print_time("post attn layernorm time: ", t4-t3)
+        print_time("post attn layernorm: ", t4-t3, group="DecoderLayer")
 
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
         t5 = time.time()
-        print_time("mlp time: ", t5-t4)
+        print_time("mlp: ", t5-t4, group="DecoderLayer")
         # hidden_states = residual + hidden_states
         outputs = (hidden_states,)
 
@@ -236,6 +383,11 @@ class StreamAttention(torch.nn.Module):
     def __init__(self, self_attn):
         super().__init__()
         self.self_attn = self_attn
+        self.cache_states = {}
+        # Pre-allocate tensors for better memory reuse
+        self._query_states = None
+        self._key_states = None 
+        self._value_states = None
     
     def __getattr__(self, name):
         """inherit attributes"""
@@ -243,6 +395,20 @@ class StreamAttention(torch.nn.Module):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self.self_attn, name)
+
+    def _maybe_cache_key_value_states(self, hidden_states: torch.Tensor):
+        if "key_states" in self.cache_states and "value_states" in self.cache_states:
+            return
+        # Use in-place operations where possible
+        self.cache_states["key_states"] = self.k_proj(hidden_states)
+        self.cache_states["value_states"] = self.v_proj(hidden_states)
+
+    def _clean_key_value_cache(self):
+        self.cache_states = {}
+        # Clear pre-allocated tensors
+        self._query_states = None
+        self._key_states = None
+        self._value_states = None
 
     # Adapted from Attention.forward
     def forward(
@@ -269,17 +435,23 @@ class StreamAttention(torch.nn.Module):
             chunk_startidx, chunk_endidx, chunk_len = 0, q_len, q_len
 
         t1 = time.time()
+        # Cache key and value states for chunked processing
+        # self._maybe_cache_key_value_states(hidden_states)
+        
+        # Reuse cached states if available
+        # key_states = self.cache_states.get("key_states", self.k_proj(hidden_states))
+        # value_states = self.cache_states.get("value_states", self.v_proj(hidden_states))
+        
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        # print("k v compute time: ", time.time() - t1)
 
-        if key_states is None:
-            key_states = self.k_proj(hidden_states)
-            print_time("k projection time: ", time.time()-t1)
-        if value_states is None:
-            value_states = self.v_proj(hidden_states)
-
+        # Only compute query states for the current chunk
         query_states = self.q_proj(hidden_states[:, chunk_startidx:chunk_endidx, :])
-        t2 = time.time()
-        print_time("kv projection time: ", t2-t1)
 
+        t2 = time.time()
+        print_time("q projection time: ", t2-t1)
+        # Compute RoPE embeddings efficiently
         if position_embeddings is None:
             logger.warning_once(
                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
@@ -302,6 +474,7 @@ class StreamAttention(torch.nn.Module):
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
+        # Apply RoPE efficiently
         key_states = apply_rotary_pos_emb(key_states, cos, sin)
         query_states = apply_rotary_pos_emb(query_states, cos[:, chunk_startidx:chunk_endidx], sin[:, chunk_startidx:chunk_endidx])
 
@@ -316,17 +489,16 @@ class StreamAttention(torch.nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        # Optimize attention mask handling
         causal_mask = attention_mask
         if attention_mask is not None:
             causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+            # causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :]
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
         if query_states.device.type == "cuda" and causal_mask is not None:
             query_states = query_states.contiguous()
-            # query_states = query_states.contiguous()
-            # for query_states in query_states:
-            #     query_states = query_states.contiguous()
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
 
@@ -357,6 +529,10 @@ class StreamAttention(torch.nn.Module):
         t8 = time.time()
         print_time("o projection time: ", t8-t7)
 
+        # clearn cache when the last chunk is processed
+        if chunk_endidx >= q_len:
+            self._clean_key_value_cache()
+
         return attn_output, None, past_key_value
 
 
@@ -365,15 +541,17 @@ class StreamModel(torch.nn.Module):
         """ The StreamModel class wraps the original model to save the memory usage. """
         super().__init__()
         self.logits_chunk_size = logits_chunk_size
+        self.stream_checkpoint = stream_checkpoint
+        self.checkpoint_chunk_size = checkpoint_chunk_size
         self.model = model
 
         # enable transformer layer to forward in chunk mode, i.e. calculate the query states
         # of a particular chunk (NOTE: the key and value states are still calculated for the whole sequence)
         self._setup_stream_forward()
 
-        if stream_checkpoint:
-            # when calculating the gradient for checkpointed layer, re-forward and backward in stream mode
-            self.gradient_checkpointing_enable(checkpoint_chunk_size=checkpoint_chunk_size)
+        # if stream_checkpoint:
+        #     # when calculating the gradient for a checkpointed layer, re-forward and backward in stream mode
+        #     self.gradient_checkpointing_enable(checkpoint_chunk_size=checkpoint_chunk_size)
 
     def _setup_stream_forward(self):
         # TODO: add check for layer type
@@ -388,27 +566,30 @@ class StreamModel(torch.nn.Module):
         except AttributeError:
             return getattr(self.model, name)
 
-    def gradient_checkpointing_enable(self: "PreTrainedModel", gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None, checkpoint_chunk_size: int = 500):
+    def gradient_checkpointing_enable(self: "PreTrainedModel", gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None):
         r"""
         Activates gradient checkpointing for the current model.
 
         Modification of the original method to enable gradient checkpointing for block-wise optimizer.
         """
-        # from torch.utils.checkpoint import checkpoint
         from functools import partial
 
         if not self.supports_gradient_checkpointing:
             raise ValueError("{} does not support gradient checkpointing.".format(self.__class__.__name__))
 
-        # if gradient_checkpointing_kwargs is None:
-        #     gradient_checkpointing_kwargs = {"use_reentrant": True}
-
-        # gradient_checkpointing_func = partial(checkpoint, **gradient_checkpointing_kwargs)
-
-        # TODO: handle the argument of use_reentrant
-        CheckpointFunctionForStreamBackward.chunk_size = checkpoint_chunk_size
-
-        gradient_checkpointing_func = CheckpointFunctionForStreamBackward.apply
+        if self.stream_checkpoint:
+            # TODO: handle the argument of use_reentrant
+            def stream_gradient_checkpointing_func(func, *args, **kwargs):
+                CheckpointFunctionForStreamBackward.chunk_size = self.checkpoint_chunk_size
+                preserve = kwargs.pop("preserve_rng_state", True)
+                return CheckpointFunctionForStreamBackward.apply(func, preserve, *args, **kwargs)
+            
+            gradient_checkpointing_func = stream_gradient_checkpointing_func
+        else:
+            if gradient_checkpointing_kwargs is None:
+                gradient_checkpointing_kwargs = {"use_reentrant": True}
+            from torch.utils.checkpoint import checkpoint
+            gradient_checkpointing_func = partial(checkpoint, **gradient_checkpointing_kwargs)
 
         def custom_gradient_checkpointing_func(func, *args, **kwargs):
             module: "torch.nn.Module" = func.__self__
@@ -417,8 +598,9 @@ class StreamModel(torch.nn.Module):
                 for arg in args:
                     if torch.is_tensor(arg) and torch.is_floating_point(arg):
                         arg.requires_grad_(True)
+                        break # TODO: for avoiding enabling gradient of causal_mask; need to make it more elegant
 
-            return gradient_checkpointing_func(func, True, *args, **kwargs) # TODO: handle the argument of preserve_rng_state
+            return gradient_checkpointing_func(func, *args, **kwargs)
 
         if "value" in inspect.signature(self._set_gradient_checkpointing).parameters:  # old GC format
             self.apply(partial(self._set_gradient_checkpointing, value=True))
@@ -469,6 +651,7 @@ class StreamModel(torch.nn.Module):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         model = self.model # the causal model
  
+        t1 = time.time()
         outputs = model.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -482,7 +665,7 @@ class StreamModel(torch.nn.Module):
             cache_position=cache_position,
             **kwargs,
         )
-
+        print("base model time: ", time.time() - t1)
         hidden_states = outputs[0]
         B, T, C = hidden_states.size()
 
