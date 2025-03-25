@@ -19,9 +19,9 @@ import gc
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 verbose=0
-selected_group = ["Checkpoint", "Attention", "DecoderLayer"]
+selected_group = ["Attention"]
 time_record = {}
-measure_time = False
+measure_time = True
 def print_time(msg, time, group=""):
     if selected_group is not None and group not in selected_group:
         return
@@ -191,7 +191,7 @@ class StreamDecoderLayer(nn.Module):
 
     def _setup_attn(self):
         """enable stream forward"""
-        self.base_layer.self_attn = StreamAttention(self.base_layer.self_attn)
+        self.base_layer.self_attn = StreamAttention_v2(self.base_layer.self_attn)
 
     def __getattr__(self, name):
         """inherit attributes"""
@@ -463,6 +463,133 @@ class StreamAttention(torch.nn.Module):
 
         return attn_output, None, past_key_value
 
+class StreamAttention_v2(StreamAttention):
+    def __init__(self, self_attn):
+        super().__init__(self_attn)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        chunk_range: Optional[Tuple[int, int]] = None,
+        key_states: Optional[torch.Tensor] = None,
+        value_states: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+        bsz, q_len, _ = hidden_states.size()
+        if chunk_range is not None:
+            chunk_startidx, chunk_endidx = chunk_range
+            chunk_len = chunk_endidx - chunk_startidx
+        else:
+            chunk_startidx, chunk_endidx, chunk_len = 0, q_len, q_len
+
+        sync_cuda()
+        t1 = time.perf_counter()
+
+        key_states = self.k_proj(hidden_states[:, :chunk_endidx, :])
+        value_states = self.v_proj(hidden_states[:, :chunk_endidx, :])
+
+        # Only compute query states for the current chunk
+        query_states = self.q_proj(hidden_states[:, chunk_startidx:chunk_endidx, :])
+
+        sync_cuda()
+        t2 = time.perf_counter()
+        # print_time("projection time: ", t2-t1, group='Attention')
+        # Compute RoPE embeddings efficiently
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+
+        t3 = time.perf_counter()
+        print_time("rope time: ", t3-t2, group='Attention')
+
+        query_states = query_states.view(bsz, chunk_len, -1, self.head_dim).transpose(1, 2)
+
+        key_states = key_states.view(bsz, chunk_endidx, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, chunk_endidx, -1, self.head_dim).transpose(1, 2)
+
+        t4 = time.perf_counter()
+        print_time("transpose time: ", t4-t3, group='Attention')
+
+        # Apply RoPE efficiently
+        key_states = apply_rotary_pos_emb(key_states, cos[:, :chunk_endidx], sin[:, :chunk_endidx])
+
+        query_states = apply_rotary_pos_emb(query_states, cos[:, chunk_startidx:chunk_endidx], sin[:, chunk_startidx:chunk_endidx])
+
+        sync_cuda()
+        t5 = time.perf_counter()
+        print_time("apply rope time: ", t5-t4, group='Attention')
+        # TODO: check the meaning of this section
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Optimize attention mask handling
+        causal_mask = attention_mask
+        if attention_mask is not None:
+            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+            # causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :]
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and causal_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        is_causal = True if causal_mask is None and q_len > 1 else False
+
+        causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :]
+
+        sync_cuda()
+        t6 = time.perf_counter()
+        # print_time("pre attn time: ", t6-t5, group='Attention')
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+
+        sync_cuda()
+        t7 = time.perf_counter()
+        # print_time("attn time: ", t7-t6, group='Attention')
+
+        attn_output = attn_output.transpose(1, 2).contiguous() # TODO: check
+        attn_output = attn_output.view(bsz, chunk_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        sync_cuda()
+        t8 = time.perf_counter()
+        # print_time("o projection time: ", t8-t7, group='Attention')
+
+        # clearn cache when the last chunk is processed
+        if chunk_endidx >= q_len:
+            self._clean_key_value_cache()
+
+        return attn_output, None, past_key_value
 
 class StreamModel(torch.nn.Module):
     def __init__(self, model: PreTrainedModel, logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
@@ -614,7 +741,8 @@ class StreamModel(torch.nn.Module):
                 continue
 
             loss_chunk = model.loss_function(logits=logits_chunk, labels=labels_chunk, vocab_size=model.config.vocab_size) * valid_position_num_chunk
-            loss_chunk.backward(retain_graph=True if i < num_chunks-1 else False)
+            # TODO: use block wise gradient accumulation for avoiding storing two copies of lm_head's gradient
+            loss_chunk.backward()
 
             del logits_chunk.grad
             del logits_chunk

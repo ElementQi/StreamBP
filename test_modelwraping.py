@@ -6,63 +6,59 @@ import os
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--checkpoint_chunksize", type=int, default=500)
-parser.add_argument("--seq_expansion", type=int, default=1)
+parser.add_argument("--chunk_size", type=int, default=500)
+parser.add_argument("--seq_len", type=int, default=3000)
+parser.add_argument("--batch_size", type=int, default=1)
+parser.add_argument("--mode", type=str, default="stream")
 args = parser.parse_args()
 
 torch.set_printoptions(precision=8)
+torch.manual_seed(0)
 
 def clean_grad(model):
     for param in model.parameters():
         param.grad = None
 
-# USE_STREAM = True
-# USE_MINIS = True
-# MODE = "minis"
-MODE = "stream"
-RECORD_MEMORY = False
-CHECKPOINT_CHUNKSIZE = args.checkpoint_chunksize
-gradient_accumulation_steps = 1
+RECORD_MEMORY = True
+VOCAB_SIZE = 128256
+MAX_PAD_RATIO = 0.2
+GRAD_ACCUMULATION_STEPS = 2
 
-# load data
-input_ids = torch.load("test_data_model/input_ids.pt")
-attention_mask = torch.load("test_data_model/attention_mask.pt")
-labels = torch.load("test_data_model/labels.pt")
+# generate data
+input_ids = torch.randint(0, VOCAB_SIZE, (args.batch_size, args.seq_len)).cuda()
+attention_mask = torch.ones_like(input_ids).cuda()
+for mask in attention_mask:
+    mask[-torch.randint(1, int(args.seq_len*MAX_PAD_RATIO), (1,)):] = 0
+labels = input_ids.clone()
 
-batch_size = 1
-input_ids = torch.cat([input_ids for _ in range(batch_size)], dim=0)
-attention_mask = torch.cat([attention_mask for _ in range(batch_size)], dim=0)
-labels = torch.cat([labels for _ in range(batch_size)], dim=0)
 
-seq_expansion = args.seq_expansion
-input_ids = torch.cat([input_ids for _ in range(seq_expansion)], dim=1)
-attention_mask = torch.cat([attention_mask for _ in range(seq_expansion)], dim=1)
-labels = torch.cat([labels for _ in range(seq_expansion)], dim=1)
 
-# base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B").bfloat16().to(input_ids.device)
-base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B").to(input_ids.device)
+base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B").bfloat16().to(input_ids.device)
 base_model.train()
 
 forward_model = base_model
-if MODE == "stream":
+if args.mode == "stream":
     print("using stream model")
-    # forward_model = StreamModel(base_model, logits_chunk_size=3000, checkpoint_chunk_size=3000*seq_expansion)
-    forward_model = StreamModel(base_model, logits_chunk_size=100, checkpoint_chunk_size=CHECKPOINT_CHUNKSIZE, stream_checkpoint=True)
+    forward_model = StreamModel(base_model, logits_chunk_size=100, checkpoint_chunk_size=args.chunk_size, stream_checkpoint=True)
     forward_model.gradient_checkpointing_enable()
-elif MODE == "minis":
+elif args.mode == "minis":
+    print("using minis model")
     from minis.mini_sequence import minisequence
-    forward_model = minisequence(base_model, chunk_size=1000)
-else:
+    forward_model = minisequence(base_model, logits_chunk_size=100, chunk_size=args.chunk_size)
+elif args.mode == "base":
     print("using base model with gradient checkpointing")
     base_model.gradient_checkpointing_enable()
+else:
+    raise ValueError(f"Invalid mode: {args.mode}")
 
 if RECORD_MEMORY:
     torch.cuda.memory._record_memory_history(max_entries=1000000)
 
 # forward_model.gradient_checkpointing_enable()
+torch.cuda.synchronize()
 t1 = time.perf_counter()
 
-for i in range(gradient_accumulation_steps):
+for i in range(GRAD_ACCUMULATION_STEPS):
     output = forward_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -79,12 +75,13 @@ for i in range(gradient_accumulation_steps):
     # clean_grad(forward_model)
     
 if RECORD_MEMORY:
-    torch.cuda.memory._dump_snapshot(f"test_data_model/memory_record_modelwrap.pickle")
+    torch.cuda.memory._dump_snapshot(f"test_data_model/memory_{args.mode}_cz{args.chunk_size}_seqlen{args.seq_len}.pickle")
     torch.cuda.memory._record_memory_history(enabled=None)
 
+torch.cuda.synchronize()
 total_time = time.perf_counter() - t1
 print("Time taken: ", total_time)
-print("allocated: ", torch.cuda.memory_allocated() / 1e9, "max allocated: ", torch.cuda.max_memory_allocated() / 1e9)
+print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
 
 print(output.loss)
 
@@ -107,5 +104,9 @@ print(output.loss)
 
 
 # print(forward_model.lm_head.weight.grad[0])
-# print(forward_model.model.model.layers[0].self_attn.q_proj.weight.grad[0])
-# print(forward_model.model.layers[0].self_attn.q_proj.weight.grad[0])
+# if hasattr(forward_model.model, "model"):
+#     print(forward_model.model.model.layers[0].self_attn.q_proj.weight.grad[0])
+# else:
+#     print(forward_model.model.layers[0].self_attn.q_proj.weight.grad[0])
+
+# print(forward_model.model.layers[0].self_attn.q_proj.weight.grad[0]) 
