@@ -585,24 +585,26 @@ class StreamAttention_v2(StreamAttention):
         t8 = time.perf_counter()
         # print_time("o projection time: ", t8-t7, group='Attention')
 
-        # clearn cache when the last chunk is processed
+        # clear cache when the last chunk is processed
         if chunk_endidx >= q_len:
             self._clean_key_value_cache()
 
         return attn_output, None, past_key_value
 
 class StreamModel(torch.nn.Module):
-    def __init__(self, model: PreTrainedModel, logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
+    def __init__(self, model: PreTrainedModel, gradient_accumulation_steps, logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
         """ The StreamModel class wraps the original model to save the memory usage. """
         super().__init__()
         self.logits_chunk_size = logits_chunk_size
         self.stream_checkpoint = stream_checkpoint
         self.checkpoint_chunk_size = checkpoint_chunk_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.model = model
 
         # enable transformer layer to forward in chunk mode, i.e. calculate the query states
         # of a particular chunk (NOTE: the key and value states are still calculated for the whole sequence)
         self._setup_stream_forward()
+        self._setup_gradient_accumulation()
 
         # if stream_checkpoint:
         #     # when calculating the gradient for a checkpointed layer, re-forward and backward in stream mode
@@ -613,6 +615,10 @@ class StreamModel(torch.nn.Module):
         # TODO: avoid modifying the base model's behavior
         for i in range(len(self.model.model.layers)):
             self.model.model.layers[i] = StreamDecoderLayer(self.model.model.layers[i])
+
+    def _setup_gradient_accumulation(self):
+        self._cur_gradient_accumulation_step = 0
+        self._valid_pos_num = 0
 
     def __getattr__(self, name):
         """inherit attributes from model"""
@@ -727,7 +733,10 @@ class StreamModel(torch.nn.Module):
         loss = torch.tensor(0., device=hidden_states.device)
         num_chunks = math.ceil(T / self.logits_chunk_size)
 
-        detached_hidden_states = hidden_states.detach().requires_grad_(True)
+        detached_hidden_states = hidden_states.detach().contiguous().requires_grad_(True)
+
+        if model.lm_head.weight.grad is None:
+            model.lm_head.weight.grad = torch.zeros_like(model.lm_head.weight)
 
         for i in range(num_chunks):
             start = i * self.logits_chunk_size
@@ -735,24 +744,33 @@ class StreamModel(torch.nn.Module):
 
             logits_chunk = model.lm_head(detached_hidden_states[:, start:end, :])
             labels_chunk = labels[:, start:end]
-            valid_position_num_chunk = (labels_chunk != -100).sum().item() - 1
+            chunk_valid_posnum = (labels_chunk != -100).sum().item() - 1
 
-            if valid_position_num_chunk == 0:
+            if chunk_valid_posnum == 0:
                 continue
 
-            loss_chunk = model.loss_function(logits=logits_chunk, labels=labels_chunk, vocab_size=model.config.vocab_size) * valid_position_num_chunk
+            loss_chunk = model.loss_function(logits=logits_chunk, labels=labels_chunk, vocab_size=model.config.vocab_size) * chunk_valid_posnum
             # TODO: use block wise gradient accumulation for avoiding storing two copies of lm_head's gradient
-            loss_chunk.backward()
+            # loss_chunk.backward()
+            loss_chunk.backward(inputs=[detached_hidden_states, logits_chunk])
+
+            # This helps avoids storing two copies of lm_head's gradient
+            # TODO: how about calculating the gradient of embeddings?
+            with torch.no_grad():
+                model.lm_head.weight.grad.addmm_(
+                    logits_chunk.grad.view(-1, model.config.vocab_size).T,
+                    detached_hidden_states[:, start:end, :].reshape(-1, C),
+                )
 
             del logits_chunk.grad
             del logits_chunk
             loss += loss_chunk.detach()
 
         # normalize loss and gradient
-        valid_position_num = (labels != -100).sum().item()
-        loss.div_(valid_position_num)
-        detached_hidden_states.grad.div_(valid_position_num)
-        model.lm_head.weight.grad.div_(valid_position_num)
+        batch_valid_posnum = (labels != -100).sum().item()
+        loss.div_(batch_valid_posnum)
+        detached_hidden_states.grad.div_(batch_valid_posnum)
+        model.lm_head.weight.grad.div_(batch_valid_posnum)
 
         torch.autograd.backward(hidden_states, grad_tensors=detached_hidden_states.grad.detach())
         detached_hidden_states.grad = None
