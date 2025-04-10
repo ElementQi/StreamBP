@@ -121,41 +121,38 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
         backward_time = 0
         # print("run_function: ", ctx.run_function)
         for i in range(num_chunks):
-            s = torch.cuda.Stream()
-            with torch.cuda.stream(s):
-                start = i * ctx.chunk_size
-                end = min((i+1)*ctx.chunk_size, hidden_states_grad.size(1))
-                # torch.cuda.memory._record_memory_history(max_entries=1000000)
-                with torch.enable_grad():
-                    sync_cuda()
-                    t1 = time.perf_counter()
-                    outputs = ctx.run_function(*detached_inputs, chunk_range=(start, end)) # TODO: make it more elegant
-                    sync_cuda()
-                    chunk_forward_time = time.perf_counter() - t1
-                    forward_time += chunk_forward_time
-                    print_time(f"chunked forward time: ", chunk_forward_time, group="Checkpoint")
-                    # print_time(f"chunked forward time {i+1}/{num_chunks}: ", chunk_forward_time, group="Checkpoint")
-                    if isinstance(outputs, tuple):
-                        hidden_states = outputs[0]
-                    else:
-                        hidden_states = outputs
-                    sync_cuda()
-                    t2 = time.perf_counter()
-                    torch.autograd.backward(
-                            hidden_states,
-                            grad_tensors=hidden_states_grad[:, start:end, :].detach(), 
-                            retain_graph=True if end < hidden_states_grad.size(1) else False # TODO: should be avoided
-                        )
+            start = i * ctx.chunk_size
+            end = min((i+1)*ctx.chunk_size, hidden_states_grad.size(1))
+            # torch.cuda.memory._record_memory_history(max_entries=1000000)
+            with torch.enable_grad():
+                sync_cuda()
+                t1 = time.perf_counter()
+                outputs = ctx.run_function(*detached_inputs, chunk_range=(start, end)) # TODO: make it more elegant
+                sync_cuda()
+                chunk_forward_time = time.perf_counter() - t1
+                forward_time += chunk_forward_time
+                print_time(f"chunked forward time: ", chunk_forward_time, group="Checkpoint")
+                # print_time(f"chunked forward time {i+1}/{num_chunks}: ", chunk_forward_time, group="Checkpoint")
+                if isinstance(outputs, tuple):
+                    hidden_states = outputs[0]
+                else:
+                    hidden_states = outputs
+                sync_cuda()
+                t2 = time.perf_counter()
+                torch.autograd.backward(
+                        hidden_states,
+                        grad_tensors=hidden_states_grad[:, start:end, :].detach(), 
+                        retain_graph=True if end < hidden_states_grad.size(1) else False # TODO: should be avoided
+                    )
 
-                    # torch.cuda.memory._dump_snapshot(f"test_data_model/memory_record_checkpoint.pickle")
-                    # torch.cuda.memory._record_memory_history(enabled=None)
-                    sync_cuda()
-                    chunk_backward_time = time.perf_counter() - t2
-                    backward_time += chunk_backward_time
-                print_time(f"chunked backward time: ", chunk_backward_time, group="Checkpoint")
-                # print_time(f"chunked backward time {i+1}/{num_chunks}: ", chunk_backward_time, group="Checkpoint")
+                # torch.cuda.memory._dump_snapshot(f"test_data_model/memory_record_checkpoint.pickle")
+                # torch.cuda.memory._record_memory_history(enabled=None)
+                sync_cuda()
+                chunk_backward_time = time.perf_counter() - t2
+                backward_time += chunk_backward_time
+            print_time(f"chunked backward time: ", chunk_backward_time, group="Checkpoint")
+            # print_time(f"chunked backward time {i+1}/{num_chunks}: ", chunk_backward_time, group="Checkpoint")
 
-        torch.cuda.current_stream().wait_stream(s)
         grads = tuple(
             inp.grad if isinstance(inp, torch.Tensor) else None
             for inp in detached_inputs
@@ -304,31 +301,13 @@ class StreamAttention(torch.nn.Module):
         super().__init__()
         self.self_attn = self_attn
         self.cache_states = {}
-        # Pre-allocate tensors for better memory reuse
-        self._query_states = None
-        self._key_states = None 
-        self._value_states = None
-    
+
     def __getattr__(self, name):
         """inherit attributes"""
         try:
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self.self_attn, name)
-
-    def _maybe_cache_key_value_states(self, hidden_states: torch.Tensor):
-        if "key_states" in self.cache_states and "value_states" in self.cache_states:
-            return
-        # Use in-place operations where possible
-        self.cache_states["key_states"] = self.k_proj(hidden_states)
-        self.cache_states["value_states"] = self.v_proj(hidden_states)
-
-    def _clean_key_value_cache(self):
-        self.cache_states = {}
-        # Clear pre-allocated tensors
-        self._query_states = None
-        self._key_states = None
-        self._value_states = None
 
     # Adapted from Attention.forward
     def forward(
@@ -585,20 +564,17 @@ class StreamAttention_v2(StreamAttention):
         t8 = time.perf_counter()
         # print_time("o projection time: ", t8-t7, group='Attention')
 
-        # clear cache when the last chunk is processed
-        if chunk_endidx >= q_len:
-            self._clean_key_value_cache()
-
         return attn_output, None, past_key_value
 
 class StreamModel(torch.nn.Module):
-    def __init__(self, model: PreTrainedModel, gradient_accumulation_steps, logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
+    def __init__(self, model: PreTrainedModel, gradient_accumulation_steps, gradient_accumulation_mode="sum", logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
         """ The StreamModel class wraps the original model to save the memory usage. """
         super().__init__()
         self.logits_chunk_size = logits_chunk_size
         self.stream_checkpoint = stream_checkpoint
         self.checkpoint_chunk_size = checkpoint_chunk_size
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.gradient_accumulation_mode = gradient_accumulation_mode
         self.model = model
 
         # enable transformer layer to forward in chunk mode, i.e. calculate the query states
@@ -769,11 +745,20 @@ class StreamModel(torch.nn.Module):
         # normalize loss and gradient
         batch_valid_posnum = (labels != -100).sum().item()
         loss.div_(batch_valid_posnum)
-        detached_hidden_states.grad.div_(batch_valid_posnum)
-        model.lm_head.weight.grad.div_(batch_valid_posnum)
+        # detached_hidden_states.grad.div_(batch_valid_posnum)
+        # model.lm_head.weight.grad.div_(batch_valid_posnum)
 
         torch.autograd.backward(hidden_states, grad_tensors=detached_hidden_states.grad.detach())
         detached_hidden_states.grad = None
+
+        self._cur_gradient_accumulation_step += 1
+        self._valid_pos_num += batch_valid_posnum
+        if self._cur_gradient_accumulation_step == self.gradient_accumulation_steps:
+            for param in self.parameters():
+                if param.grad is not None:
+                    param.grad.div_(self._valid_pos_num)
+            self._cur_gradient_accumulation_step = 0
+            self._valid_pos_num = 0
 
         if not return_dict:
             output = (logits,) + outputs[1:]
