@@ -15,13 +15,14 @@ import torch.nn as nn
 from torch.utils.checkpoint import check_backward_validity, _infer_device_type, _get_autocast_kwargs, _get_device_module, get_device_states, detach_variable
 import time
 import gc
+import random
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 verbose=0
 selected_group = ["Attention"]
 time_record = {}
-measure_time = True
+measure_time = False
 def print_time(msg, time, group=""):
     if selected_group is not None and group not in selected_group:
         return
@@ -538,11 +539,23 @@ class StreamAttention_v2(StreamAttention):
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
         is_causal = True if causal_mask is None and q_len > 1 else False
 
-        causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :]
+        # causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :]
+
+        # if causal_mask is not None:
+        #     causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :] # TODO: handle the case where causal_mask is None
 
         sync_cuda()
         t6 = time.perf_counter()
         # print_time("pre attn time: ", t6-t5, group='Attention')
+
+        # TODO: handle corner case
+        if chunk_startidx <= 0:
+            causal_mask = None
+            is_causal = True
+        else:
+            causal_mask = self._generate_causal_mask(chunk_startidx, chunk_endidx, bsz, query_states.dtype, query_states.device)
+            is_causal = False
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
@@ -555,7 +568,6 @@ class StreamAttention_v2(StreamAttention):
         sync_cuda()
         t7 = time.perf_counter()
         # print_time("attn time: ", t7-t6, group='Attention')
-
         attn_output = attn_output.transpose(1, 2).contiguous() # TODO: check
         attn_output = attn_output.view(bsz, chunk_len, -1)
         attn_output = self.o_proj(attn_output)
@@ -565,6 +577,35 @@ class StreamAttention_v2(StreamAttention):
         # print_time("o projection time: ", t8-t7, group='Attention')
 
         return attn_output, None, past_key_value
+
+    def _generate_causal_mask(self, chunk_startidx, chunk_endidx, batch_size, dtype, device):
+        min_dtype = torch.finfo(dtype).min
+        if chunk_startidx == 0:
+            return torch.full((chunk_endidx, chunk_endidx), fill_value=min_dtype, dtype=dtype, device=device).triu(diagonal=1)
+
+        chunk_len = chunk_endidx - chunk_startidx
+        mask_1 = torch.zeros(chunk_len, chunk_startidx, dtype=dtype, device=device)
+        mask_2 = torch.full((chunk_len, chunk_len), fill_value=min_dtype, dtype=dtype, device=device).triu(diagonal=1)
+
+        mask = torch.cat([mask_1, mask_2], dim=1).expand(batch_size, 1, -1, -1)
+        return mask
+
+    def _generate_causal_mask_v2(self, chunk_startidx, chunk_endidx, batch_size, dtype, device):
+        if chunk_startidx == 0:
+            # For the first chunk, create a standard causal mask (upper triangular with False values)
+            mask = torch.ones((chunk_endidx, chunk_endidx), dtype=torch.bool, device=device)
+            mask = mask.tril(diagonal=0)  # Lower triangular including diagonal is True
+            return mask
+
+        chunk_len = chunk_endidx - chunk_startidx
+        # All positions in the history can be attended to
+        mask_1 = torch.ones(chunk_len, chunk_startidx, dtype=torch.bool, device=device)
+        # For the current chunk, create a causal mask
+        mask_2 = torch.ones((chunk_len, chunk_len), dtype=torch.bool, device=device).tril(diagonal=0)
+
+        # Concatenate and expand for batch dimension
+        mask = torch.cat([mask_1, mask_2], dim=1).expand(batch_size, 1, -1, -1)
+        return mask
 
 class StreamModel(torch.nn.Module):
     def __init__(self, model: PreTrainedModel, gradient_accumulation_steps, gradient_accumulation_mode="sum", logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
@@ -662,6 +703,10 @@ class StreamModel(torch.nn.Module):
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
+        if attention_mask is not None:
+            print("Set the attention mask to None for memory efficiency") # TODO: make it more elegant
+            attention_mask = None
+
         if not self.training:
             return self.model(
                 input_ids=input_ids,
@@ -720,9 +765,9 @@ class StreamModel(torch.nn.Module):
 
             logits_chunk = model.lm_head(detached_hidden_states[:, start:end, :])
             labels_chunk = labels[:, start:end]
-            chunk_valid_posnum = (labels_chunk != -100).sum().item() - 1
+            chunk_valid_posnum = (labels_chunk != -100).sum().item() - 1 # -1 for the last token
 
-            if chunk_valid_posnum == 0:
+            if chunk_valid_posnum <= 0:
                 continue
 
             loss_chunk = model.loss_function(logits=logits_chunk, labels=labels_chunk, vocab_size=model.config.vocab_size) * chunk_valid_posnum
