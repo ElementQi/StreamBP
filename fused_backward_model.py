@@ -765,6 +765,8 @@ class StreamModel(torch.nn.Module):
 
             logits_chunk = model.lm_head(detached_hidden_states[:, start:end, :])
             labels_chunk = labels[:, start:end]
+
+            # TODO: check correctness
             chunk_valid_posnum = (labels_chunk != -100).sum().item() - 1 # -1 for the last token
 
             if chunk_valid_posnum <= 0:
@@ -776,7 +778,7 @@ class StreamModel(torch.nn.Module):
             loss_chunk.backward(inputs=[detached_hidden_states, logits_chunk])
 
             # This helps avoids storing two copies of lm_head's gradient
-            # TODO: how about calculating the gradient of embeddings?
+            # When using ZeRO-2, lm_head's gradient will be reduced in the end of backward pass, i.e. in _backward_epilogue function function
             with torch.no_grad():
                 model.lm_head.weight.grad.addmm_(
                     logits_chunk.grad.view(-1, model.config.vocab_size).T,

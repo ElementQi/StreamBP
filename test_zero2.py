@@ -15,20 +15,12 @@ torch.manual_seed(0)
 torch.cuda.manual_seed(0)
 
 # Load model and tokenizer
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+# model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B")
 
 # model = StreamModel(model, gradient_accumulation_steps=1, logits_chunk_size=100, checkpoint_chunk_size=500, stream_checkpoint=False)
 model.train()
 model.gradient_checkpointing_enable()
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-
-# generate data
-input_ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN))
-attention_mask = torch.ones_like(input_ids)
-for mask in attention_mask:
-    mask[-torch.randint(1, int(SEQ_LEN*MAX_PAD_RATIO), (1,)):] = 0
-labels = input_ids.clone()
-labels[attention_mask == 0] = -100
 
 # Create DeepSpeed config dictionary
 ds_config = {
@@ -57,17 +49,36 @@ model_engine, optimizer, _, _ = deepspeed.initialize(
     config=ds_config
 )
 
-input_ids = input_ids.to(model.device)
-attention_mask = attention_mask.to(model.device)
-labels = labels.to(model.device)
+from deepspeed import comm as dist
+rank = dist.get_rank()
+world_size = dist.get_world_size()
 
-# Forward and backward pass
-outputs = model_engine(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
+# generate data
+input_ids = torch.randint(0, VOCAB_SIZE, (world_size, BATCH_SIZE, SEQ_LEN))
+
+local_input_ids = input_ids[rank]
+local_attention_mask = torch.ones_like(local_input_ids)
+for mask in local_attention_mask:
+    mask[-torch.randint(1, int(SEQ_LEN*MAX_PAD_RATIO), (1,)):] = 0
+
+local_labels = local_input_ids.clone()
+local_labels[local_attention_mask == 0] = -100
+
+local_input_ids = local_input_ids.to(model.device)
+local_attention_mask = local_attention_mask.to(model.device)
+local_labels = local_labels.to(model.device)
+
+outputs = model_engine(input_ids=local_input_ids, labels=local_labels, attention_mask=local_attention_mask)
 loss = outputs.loss
+
 if loss.requires_grad:
+    # for default backward
     model_engine.backward(loss)
 else:
-    model_engine._backward_epilogue()
-model_engine.step()
+    # for stream model; gradients are already computed during the forward pass
+    model_engine._backward_epilogue() # reduce and release the ipg grads
+
+# # need to use engine.step for correctly preparing the averaged gradients
+# model_engine.step()
 
 print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
