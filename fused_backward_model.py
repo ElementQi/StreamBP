@@ -548,11 +548,16 @@ class StreamAttention_v2(StreamAttention):
         t6 = time.perf_counter()
         # print_time("pre attn time: ", t6-t5, group='Attention')
 
-        # TODO: handle corner case
-        if chunk_startidx <= 0:
+        # TODO: check corner case
+        if query_states.shape[2] == 1 and causal_mask is None:
+            # Generation mode, the new state will attend to all the previous states
+            is_causal = False
+        elif chunk_startidx <= 0:
+            # For the first chunk, we use the default causal mask
             causal_mask = None
             is_causal = True
         else:
+            # TODO: add mask generation for given attention mask
             causal_mask = self._generate_causal_mask(chunk_startidx, chunk_endidx, bsz, query_states.dtype, query_states.device)
             is_causal = False
 
@@ -561,6 +566,7 @@ class StreamAttention_v2(StreamAttention):
             key_states,
             value_states,
             attn_mask=causal_mask,
+            scale=self.scaling,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
         )
@@ -707,7 +713,7 @@ class StreamModel(torch.nn.Module):
             print("Set the attention mask to None for memory efficiency") # TODO: make it more elegant
             attention_mask = None
 
-        if not self.training:
+        if (not self.training) or (not torch.is_grad_enabled()):
             return self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

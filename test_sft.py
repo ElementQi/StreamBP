@@ -23,7 +23,8 @@ def clean_grad(model):
 RECORD_MEMORY = False
 VOCAB_SIZE = 128256
 MAX_PAD_RATIO = 0.2
-GRAD_ACCUMULATION_STEPS = 1
+GRAD_ACCUMULATION_STEPS = 2
+MODEL_NAME = "Qwen/Qwen2.5-7B"
 
 # generate data
 input_ids = torch.randint(0, VOCAB_SIZE, (args.batch_size, args.seq_len)).cuda()
@@ -34,9 +35,18 @@ labels = input_ids.clone()
 labels[attention_mask == 0] = -100
 
 # base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B").bfloat16().to(input_ids.device)
-base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B").to(input_ids.device)
-# base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B").bfloat16().to(input_ids.device)
+# base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B").to(input_ids.device)
+# base_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-32B").bfloat16().to(input_ids.device)
+base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).bfloat16().to(input_ids.device)
 base_model.train()
+
+# def remove_grad_hook(param):
+#     def func(x):
+#         param.grad = None
+#     return func
+
+# for param in base_model.parameters():
+#     param.register_post_accumulate_grad_hook(remove_grad_hook(param))
 
 forward_model = base_model
 if args.mode == "stream":
@@ -83,6 +93,7 @@ if RECORD_MEMORY:
 torch.cuda.synchronize()
 total_time = time.perf_counter() - t1
 print("Time taken: ", total_time)
+print("Per sample time taken: ", total_time / args.batch_size)
 print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
 
 print("loss: ", output.loss.item())
@@ -117,11 +128,11 @@ elif hasattr(forward_model.model, "model"):
 else:
     causal_model = forward_model
 
-print("q_proj:")
-print(causal_model.model.layers[0].self_attn.q_proj.weight.grad[0])
+# print("q_proj:")
+# print(causal_model.model.layers[0].self_attn.q_proj.weight.grad[0])
 
 # print("k_proj:")
 # print(causal_model.model.layers[0].self_attn.k_proj.weight.grad[0])
 
-print("lm_head:")
-print(causal_model.lm_head.weight.grad[0])
+# print("lm_head:")
+# print(causal_model.lm_head.weight.grad[0])
