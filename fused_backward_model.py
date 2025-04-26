@@ -676,6 +676,9 @@ class StreamModel(torch.nn.Module):
             gradient_checkpointing_func = partial(checkpoint, **gradient_checkpointing_kwargs)
 
         def custom_gradient_checkpointing_func(func, *args, **kwargs):
+            # in case that the func is a partial function
+            if hasattr(func, "func"):
+                func = func.func
             module: "torch.nn.Module" = func.__self__
 
             if any(param.requires_grad for param in module.parameters()):

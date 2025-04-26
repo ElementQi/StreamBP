@@ -3,6 +3,46 @@ from trl import GRPOTrainer
 from trl.trainer.utils import selective_log_softmax
 from trl.trainer.grpo_trainer import nanmin, nanmax
 from fused_backward_model import StreamModel
+from typing import Any, Callable, Optional, Union
+
+MAX_PAD_RATIO = 0.2  # Maximum ratio of padding tokens in a sequence
+torch.manual_seed(0)
+torch.cuda.manual_seed(0)
+
+class OriginalGRPOTrainer(GRPOTrainer):
+    def __init__(
+            self, *args, **kwargs
+        ) -> None:
+        self.vocab_size = kwargs["model"].lm_head.out_features
+        self.max_completion_length = kwargs.pop("max_completion_length") # NOTE: for generating dummy data only; to delete after testing
+        super().__init__(**kwargs)
+        
+    def _prepare_inputs(self, inputs):
+        # randomly generate some data for memory profiling
+        keys = inputs[0].keys()
+        batch_size = len(inputs)
+        device = self.model.device
+
+        batched_inputs = {}
+        for key in keys:
+            batched_inputs[key] = torch.vstack([torch.tensor(inputs[i][key]) for i in range(len(inputs))]).to(device)
+
+        completion_ids = torch.randint(0, self.vocab_size, (batch_size, self.max_completion_length))
+        completion_mask = torch.ones_like(completion_ids)
+        for mask in completion_mask:
+            mask[-torch.randint(1, int(self.max_completion_length*MAX_PAD_RATIO), (1,)):] = 0
+
+        advantage = torch.randn(batch_size)
+        old_per_token_logps = torch.randn(batch_size, self.max_completion_length)
+        ref_per_token_logps = torch.randn(batch_size, self.max_completion_length)
+
+        batched_inputs["completion_ids"] = completion_ids.to(device)
+        batched_inputs["completion_mask"] = completion_mask.to(device)
+        batched_inputs["advantages"] = advantage.to(device)
+        batched_inputs["old_per_token_logps"] = old_per_token_logps.to(device)
+        batched_inputs["ref_per_token_logps"] = ref_per_token_logps.to(device)
+
+        return batched_inputs
 
 class CustomGRPOTrainer(GRPOTrainer):
     def __init__(
@@ -10,6 +50,8 @@ class CustomGRPOTrainer(GRPOTrainer):
         ) -> None:
         assert isinstance(kwargs["model"], StreamModel), "model must be a StreamModel"
         self.chunk_size = kwargs["model"].logits_chunk_size
+        self.vocab_size = kwargs["model"].model.lm_head.out_features
+        self.max_completion_length = kwargs.pop("max_completion_length") # NOTE: for generating dummy data only; to delete after testing
         super().__init__(**kwargs)
         self.accelerator.backward = lambda loss: None # backward is fused with forward, no need to call accelerator.backward
         
@@ -18,6 +60,33 @@ class CustomGRPOTrainer(GRPOTrainer):
 
         return logits
     
+    def _prepare_inputs(self, inputs):
+        # randomly generate some data for memory profiling
+        keys = inputs[0].keys()
+        batch_size = len(inputs)
+        device = self.model.device
+
+        batched_inputs = {}
+        for key in keys:
+            batched_inputs[key] = torch.vstack([torch.tensor(inputs[i][key]) for i in range(len(inputs))]).to(device)
+
+        completion_ids = torch.randint(0, self.vocab_size, (batch_size, self.max_completion_length))
+        completion_mask = torch.ones_like(completion_ids)
+        for mask in completion_mask:
+            mask[-torch.randint(1, int(self.max_completion_length*MAX_PAD_RATIO), (1,)):] = 0
+
+        advantage = torch.randn(batch_size)
+        old_per_token_logps = torch.randn(batch_size, self.max_completion_length)
+        ref_per_token_logps = torch.randn(batch_size, self.max_completion_length)
+
+        batched_inputs["completion_ids"] = completion_ids.to(device)
+        batched_inputs["completion_mask"] = completion_mask.to(device)
+        batched_inputs["advantages"] = advantage.to(device)
+        batched_inputs["old_per_token_logps"] = old_per_token_logps.to(device)
+        batched_inputs["ref_per_token_logps"] = ref_per_token_logps.to(device)
+
+        return batched_inputs
+
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None) -> torch.Tensor:
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
