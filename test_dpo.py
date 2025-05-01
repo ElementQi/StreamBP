@@ -8,6 +8,7 @@ import argparse
 from datasets import Dataset
 import torch
 
+torch.set_printoptions(precision=8)
 torch.manual_seed(0)
 torch.cuda.manual_seed(0)
 
@@ -50,8 +51,6 @@ def create_dummy_dataset(args):
     chosen_text = tokenizer.batch_decode(chosen_ids, skip_special_tokens=True)
     rejected_text = tokenizer.batch_decode(rejected_ids, skip_special_tokens=True)
 
-    # NOTE: For memory profiling, we directly use the completion_ids rather than generating them for faster experiment
-    # See CustomGRPOTrainer._prepare_inputs for more details
     dataset_dict = {
         # "chosen_ids": chosen_ids,
         # "rejected_ids": rejected_ids,

@@ -9,6 +9,10 @@ from transformers.trainer_callback import TrainerCallback
 from fused_backward_model import StreamModel
 import argparse
 
+torch.set_printoptions(precision=8)
+torch.manual_seed(0)
+torch.cuda.manual_seed(0)
+
 class GradientMonitorCallback(TrainerCallback):
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
         model = kwargs["model"]
@@ -47,10 +51,6 @@ def create_dummy_dataset(args):
     
     dataset = Dataset.from_dict(dataset_dict)
     return dataset
-
-torch.set_printoptions(precision=8)
-torch.manual_seed(0)
-torch.cuda.manual_seed(0)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--chunk_size", type=int, default=500)
