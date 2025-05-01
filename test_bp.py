@@ -24,7 +24,8 @@ RECORD_MEMORY = False
 VOCAB_SIZE = 128256
 MAX_PAD_RATIO = 0.2
 GRAD_ACCUMULATION_STEPS = 2
-MODEL_NAME = "Qwen/Qwen2.5-7B"
+# MODEL_NAME = "Qwen/Qwen2.5-7B"
+MODEL_NAME = "Qwen/Qwen3-4B"
 
 # generate data
 input_ids = torch.randint(0, VOCAB_SIZE, (args.batch_size, args.seq_len)).cuda()

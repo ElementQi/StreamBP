@@ -55,8 +55,8 @@ torch.cuda.manual_seed(0)
 parser = argparse.ArgumentParser()
 parser.add_argument("--chunk_size", type=int, default=500)
 parser.add_argument("--mode", type=str, default="stream")
-parser.add_argument("--max_completion_len", type=int, default=128, help="Sequence length for the completion")
-parser.add_argument("--prompt_len", type=int, default=1024, help="Sequence length for the prompt")
+parser.add_argument("--max_completion_len", type=int, default=1000, help="Sequence length for the completion")
+parser.add_argument("--prompt_len", type=int, default=1000, help="Sequence length for the prompt")
 parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples to generate")
 parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model to use for training")
 parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
@@ -77,7 +77,7 @@ training_args = GRPOConfig(output_dir="Qwen2.5-0.5B-GRPO",
                            gradient_accumulation_steps=1,
                            max_completion_length=args.max_completion_len,
                            )
-model = AutoModelForCausalLM.from_pretrained(args.model_name)
+model = AutoModelForCausalLM.from_pretrained(args.model_name).bfloat16()
 
 if args.mode == "stream":
     model = StreamModel(model, gradient_accumulation_steps=1, logits_chunk_size=100, stream_checkpoint=True, checkpoint_chunk_size=args.chunk_size)

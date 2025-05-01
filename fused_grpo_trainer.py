@@ -110,7 +110,7 @@ class CustomGRPOTrainer(GRPOTrainer):
             all_logps.append(logps)
         return torch.cat(all_logps, dim=0)
 
-    def _get_hidden_states(self, model, input_ids, attention_mask):
+    def _cal_hidden_states(self, model, input_ids, attention_mask):
         # TODO: handle the ddp case: model -> module
         if isinstance(model, StreamModel):
             base_model = model.model.model
@@ -129,7 +129,7 @@ class CustomGRPOTrainer(GRPOTrainer):
 
         advantages = inputs["advantages"]
 
-        hidden_states = self._get_hidden_states(model, input_ids, attention_mask)
+        hidden_states = self._cal_hidden_states(model, input_ids, attention_mask)
         detached_hidden_states = hidden_states.detach().contiguous().requires_grad_(True)
 
         loss = torch.tensor(0., device=model.device)
