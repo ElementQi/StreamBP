@@ -2,7 +2,7 @@
 import torch
 from datasets import load_dataset
 from trl import GRPOConfig, GRPOTrainer
-from fused_grpo_trainer import CustomGRPOTrainer, OriginalGRPOTrainer
+from fused_grpo_trainer import FusedGRPOTrainer, OriginalGRPOTrainer
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_callback import TrainerCallback
@@ -42,7 +42,7 @@ def create_dummy_dataset(args):
     labels[attention_mask == 0] = -100
 
     # NOTE: For memory profiling, we directly use the completion_ids rather than generating them for faster experiment
-    # See CustomGRPOTrainer._prepare_inputs for more details
+    # See FusedGRPOTrainer._prepare_inputs for more details
     dataset_dict = {
         "prompt_ids": input_ids,
         "prompt_mask": attention_mask,
@@ -81,7 +81,7 @@ model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.
 
 if args.mode == "stream":
     model = StreamModel(model, gradient_accumulation_steps=1, logits_chunk_size=100, stream_checkpoint=True, checkpoint_chunk_size=args.chunk_size)
-    TrainerClass = CustomGRPOTrainer
+    TrainerClass = FusedGRPOTrainer
 elif args.mode == "base":
     TrainerClass = OriginalGRPOTrainer # The original GRPO trainer that enables dummy data
 else:

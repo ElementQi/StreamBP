@@ -44,7 +44,7 @@ class OriginalGRPOTrainer(GRPOTrainer):
 
         return batched_inputs
 
-class CustomGRPOTrainer(GRPOTrainer):
+class FusedGRPOTrainer(GRPOTrainer):
     def __init__(
             self, *args, **kwargs
         ) -> None:
