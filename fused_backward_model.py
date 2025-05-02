@@ -23,6 +23,8 @@ verbose=0
 selected_group = ["Attention"]
 time_record = {}
 measure_time = False
+global_dict = {}
+
 def print_time(msg, time, group=""):
     if selected_group is not None and group not in selected_group:
         return
@@ -120,10 +122,17 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
 
         forward_time = 0
         backward_time = 0
+
+        if "zero2_optimizer" in global_dict:
+            global_dict["zero2_optimizer"].process_gradients = lambda *args, **kwargs: None
+
         # print("run_function: ", ctx.run_function)
         for i in range(num_chunks):
             start = i * ctx.chunk_size
             end = min((i+1)*ctx.chunk_size, hidden_states_grad.size(1))
+
+            if i == num_chunks - 1:
+                global_dict["zero2_optimizer"].process_gradients = global_dict["zero2_gradient_process_func"]
             # torch.cuda.memory._record_memory_history(max_entries=1000000)
             with torch.enable_grad():
                 sync_cuda()
@@ -711,6 +720,10 @@ class StreamModel(torch.nn.Module):
         num_logits_to_keep: int = 0,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        
+        if "zero2_optimizer" in global_dict:
+            global_dict["zero2_gradient_process_func"] = global_dict["zero2_optimizer"].process_gradients
+            global_dict["zero2_optimizer"].process_gradients = lambda *args, **kwargs: None
 
         if attention_mask is not None:
             print("Set the attention mask to None for memory efficiency") # TODO: make it more elegant
