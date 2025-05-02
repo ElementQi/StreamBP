@@ -59,7 +59,7 @@ parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
 
 args = parser.parse_args()
 
-base_model = AutoModelForCausalLM.from_pretrained(args.model_name)
+base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
 base_model.train()
 dataset = create_dummy_dataset(args)
 

@@ -1,0 +1,3 @@
+*.pyc
+*.log
+events.out.tfevents*

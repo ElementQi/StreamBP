@@ -77,7 +77,7 @@ training_args = GRPOConfig(output_dir="Qwen2.5-0.5B-GRPO",
                            gradient_accumulation_steps=1,
                            max_completion_length=args.max_completion_len,
                            )
-model = AutoModelForCausalLM.from_pretrained(args.model_name).bfloat16()
+model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
 
 if args.mode == "stream":
     model = StreamModel(model, gradient_accumulation_steps=1, logits_chunk_size=100, stream_checkpoint=True, checkpoint_chunk_size=args.chunk_size)

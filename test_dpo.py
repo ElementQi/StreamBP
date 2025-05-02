@@ -73,7 +73,7 @@ parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help=
 parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
 args = parser.parse_args()
 
-model = AutoModelForCausalLM.from_pretrained(args.model_name)
+model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
 
 if args.mode == "stream":
     model = StreamModel(model, gradient_accumulation_steps=1, logits_chunk_size=100, stream_checkpoint=True, checkpoint_chunk_size=args.chunk_size)
