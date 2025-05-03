@@ -802,8 +802,10 @@ class StreamModel(torch.nn.Module):
             # This helps avoids storing two copies of lm_head's gradient
             # When using ZeRO-2, lm_head's gradient will be reduced in the end of backward pass, i.e. in _backward_epilogue function function
             with torch.no_grad():
+                logits_chunk_grad = logits_chunk.grad.view(-1, model.config.vocab_size).T
+                logits_chunk_grad = logits_chunk_grad.to(model.lm_head.weight.grad.dtype)
                 model.lm_head.weight.grad.addmm_(
-                    logits_chunk.grad.view(-1, model.config.vocab_size).T,
+                    logits_chunk_grad,
                     detached_hidden_states[:, start:end, :].reshape(-1, C),
                 )
 
@@ -817,7 +819,11 @@ class StreamModel(torch.nn.Module):
         # detached_hidden_states.grad.div_(batch_valid_posnum)
         # model.lm_head.weight.grad.div_(batch_valid_posnum)
 
-        torch.autograd.backward(hidden_states, grad_tensors=detached_hidden_states.grad.detach())
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            # If enabled, gradient of bf16 operator related weights will not be computed.
+            # TODO: figure out why and check if there slows down the backward
+            torch.autograd.backward(hidden_states, grad_tensors=detached_hidden_states.grad.detach())
+        
         detached_hidden_states.grad = None
 
         self._cur_gradient_accumulation_step += 1

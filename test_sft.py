@@ -56,10 +56,16 @@ parser.add_argument("--seq_len", type=int, default=3000)
 parser.add_argument("--num_samples", type=int, default=50, help="Number of samples to generate")
 parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model to use for training")
 parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training")
 
 args = parser.parse_args()
 
-base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+if args.mixed_precision:
+    # mixed precision training requires loading model in fp32
+    base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32)
+else:
+    base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+
 base_model.train()
 dataset = create_dummy_dataset(args)
 
@@ -86,6 +92,7 @@ training_args = SFTConfig(output_dir="sft",
                           per_device_train_batch_size=args.batch_size,
                           gradient_accumulation_steps=1,
                           max_length=None,
+                          bf16=args.mixed_precision,
                           learning_rate=0., # for gradient profiling
                           )
 
