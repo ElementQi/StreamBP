@@ -131,7 +131,7 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
             start = i * ctx.chunk_size
             end = min((i+1)*ctx.chunk_size, hidden_states_grad.size(1))
 
-            if i == num_chunks - 1:
+            if (i == num_chunks - 1) and "zero2_optimizer" in global_dict:
                 global_dict["zero2_optimizer"].process_gradients = global_dict["zero2_gradient_process_func"]
             # torch.cuda.memory._record_memory_history(max_entries=1000000)
             with torch.enable_grad():
