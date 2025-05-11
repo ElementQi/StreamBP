@@ -6,11 +6,34 @@ from typing import Any, Union
 from transformers import PreTrainedModel
 from trl.trainer.utils import selective_log_softmax
 
+def get_base_model(model):
+    is_base_model = False
+    while not is_base_model:
+        for attr in ["model", "base_model", "module"]:
+            if hasattr(model, attr) and not (getattr(model, attr) is model):
+                model = getattr(model, attr)
+            else:
+                is_base_model = True
+                break
+    return model
+
+def get_causal_model(model):
+    is_causal_model = False
+    while not is_causal_model:
+        if hasattr(model, "lm_head"):
+            is_causal_model = True
+            break
+        for attr in ["model", "base_model", "module"]:
+            if hasattr(model, attr) and not (getattr(model, attr) is model):
+                model = getattr(model, attr)
+                break
+    return model
+
 class FusedDPOTrainer(DPOTrainer):
     def __init__(
             self, *args, **kwargs
         ) -> None:
-        assert isinstance(kwargs["model"], StreamModel), "model must be a StreamModel"
+        # assert isinstance(kwargs["model"], StreamModel), "model must be a StreamModel"
         self.chunk_size = kwargs["model"].logits_chunk_size
         self.vocab_size = kwargs["model"].model.lm_head.out_features
         # self.max_completion_length = kwargs.pop("max_completion_length") # NOTE: for generating dummy data only; to delete after testing
@@ -44,8 +67,13 @@ class FusedDPOTrainer(DPOTrainer):
         for i in range(0, completion_len, self.chunk_size):
             logits_slice = slice(i, min(i + self.chunk_size, completion_len-1))
             label_slice = slice(i + 1, min(i + self.chunk_size+1, completion_len))
-            chunked_logdiff = self._cal_logdiff(model, hidden_states[:, logits_slice, :], input_ids[:, label_slice], attention_mask[:, label_slice], num_examples)
-            chunked_ref_logdiff = self._cal_logdiff(ref_model, hidden_states[:, logits_slice, :], input_ids[:, label_slice], attention_mask[:, label_slice], num_examples)
+            chunked_logdiff = self._cal_logdiff(get_causal_model(model), hidden_states[:, logits_slice, :], input_ids[:, label_slice], attention_mask[:, label_slice], num_examples)
+            if ref_model is not None:
+                chunked_ref_logdiff = self._cal_logdiff(get_causal_model(ref_model), hidden_states[:, logits_slice, :], input_ids[:, label_slice], attention_mask[:, label_slice], num_examples)
+            else:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    # TODO: check correctness
+                    chunked_ref_logdiff = self._cal_logdiff(get_causal_model(self.model), hidden_states[:, logits_slice, :], input_ids[:, label_slice], attention_mask[:, label_slice], num_examples)
             log_ratios.append(chunked_logdiff.sum(dim=-1) - chunked_ref_logdiff.sum(dim=-1)) # c_i
         
         log_ratios = torch.vstack(log_ratios).sum(dim=0)
@@ -85,10 +113,9 @@ class FusedDPOTrainer(DPOTrainer):
         attention_mask = torch.cat((prompt_attention_mask, completion_attention_mask), dim=1)
 
         hidden_states = self._cal_hidden_states(model, input_ids, attention_mask)
-        # print("hidden_states", hidden_states)
         detached_hidden_states = hidden_states.detach().contiguous().requires_grad_(True)
 
-        corr_factor, losses = self._cal_correction_factor(model=model, 
+        corr_factor, losses = self._cal_correction_factor(model=model,
                                                   ref_model=self.ref_model,
                                                   hidden_states=detached_hidden_states[:, prompt_len:, :],
                                                   input_ids=completion_input_ids,
@@ -127,14 +154,10 @@ class FusedDPOTrainer(DPOTrainer):
         return chosen_per_token_logps, rejected_per_token_logps, chosen_logps, rejected_logps
 
     def _cal_hidden_states(self, model, input_ids, attention_mask):
-        # TODO: handle the ddp case: model -> module
-        if isinstance(model, StreamModel):
-            base_model = model.model.model
-        else:
-            base_model = model.model
-        outputs = base_model(input_ids=input_ids, attention_mask=attention_mask)
+        model = get_base_model(model)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         return outputs[0]
-
+    
     def compute_loss(
         self,
         model: Union[PreTrainedModel, nn.Module],

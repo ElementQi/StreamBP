@@ -5,6 +5,8 @@ from datasets import Dataset
 from fused_backward_model import StreamModel
 import torch
 import argparse
+import time
+import csv
 from transformers.trainer_callback import TrainerCallback
 from fused_sft_trainer import FusedSFTTrainer
 
@@ -13,7 +15,15 @@ torch.set_printoptions(precision=8)
 torch.manual_seed(0)
 torch.cuda.manual_seed(0)
 
+log_msg = ""
+
 class GradientMonitorCallback(TrainerCallback):
+    init_time = None
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        torch.cuda.synchronize()
+        self.init_time = time.perf_counter()
+
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
         model = kwargs["model"]
         if isinstance(model, StreamModel):
@@ -21,11 +31,16 @@ class GradientMonitorCallback(TrainerCallback):
 
         step = state.global_step
         print("========== step", step, "==========")
-        print("lm_head.weight.grad", model.lm_head.weight.grad[:5, :5])
-        print("q_proj grad", model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
 
-        if step == 1:
+        if step == 10:
+            torch.cuda.synchronize()
+            print("lm_head.weight.grad", model.lm_head.weight.grad[:5, :5])
+            print("q_proj grad", model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
             print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
+            print("time taken: ", time.perf_counter() - self.init_time)
+
+            with open("sft_results.csv", "a") as f:
+                f.write(log_msg + f"{torch.cuda.memory_allocated() / 2**30}, {torch.cuda.max_memory_allocated() / 2**30}, {time.perf_counter() - self.init_time}\n")
             quit()
 
 def create_dummy_dataset(args):
@@ -56,15 +71,11 @@ parser.add_argument("--seq_len", type=int, default=3000)
 parser.add_argument("--num_samples", type=int, default=50, help="Number of samples to generate")
 parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model to use for training")
 parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
-parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training")
 
 args = parser.parse_args()
+log_msg = f"{args.mode}, {args.model_name}, {args.seq_len}, {args.chunk_size}, "
 
-if args.mixed_precision:
-    # mixed precision training requires loading model in fp32
-    base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32)
-else:
-    base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
 
 base_model.train()
 dataset = create_dummy_dataset(args)
@@ -84,6 +95,10 @@ elif args.mode == "base":
     base_model.gradient_checkpointing_enable()
     model = base_model
     TrainerClass = Trainer
+elif args.mode == "base_no_ckpt":
+    print("using base model without gradient checkpointing")
+    model = base_model
+    TrainerClass = Trainer
 else:
     raise ValueError(f"Invalid mode: {args.mode}")
 
@@ -92,7 +107,6 @@ training_args = SFTConfig(output_dir="sft",
                           per_device_train_batch_size=args.batch_size,
                           gradient_accumulation_steps=1,
                           max_length=None,
-                          bf16=args.mixed_precision,
                           learning_rate=0., # for gradient profiling
                           )
 

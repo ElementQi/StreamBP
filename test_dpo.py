@@ -4,6 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_callback import TrainerCallback
 from fused_backward_model import StreamModel
 from fused_dpo_trainer import FusedDPOTrainer
+from peft import LoraConfig, get_peft_model, PeftModel
 import argparse
 from datasets import Dataset
 import torch
@@ -22,8 +23,8 @@ class GradientMonitorCallback(TrainerCallback):
 
         step = state.global_step
         print("========== step", step, "==========")
-        print("lm_head.weight.grad", model.lm_head.weight.grad[:5, :5])
-        print("q_proj grad", model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
+        # print("lm_head.weight.grad", model.lm_head.weight.grad[:5, :5])
+        # print("q_proj grad", model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
 
         if step == 1:
             print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
@@ -71,7 +72,16 @@ parser.add_argument("--answer_len", type=int, default=3000)
 parser.add_argument("--num_samples", type=int, default=50, help="Number of samples to generate")
 parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model to use for training")
 parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+parser.add_argument("--use_lora", action="store_true", help="Use LoRA for training")
 args = parser.parse_args()
+
+lora_config = LoraConfig(
+    r=32,
+    lora_alpha=128,
+    target_modules="all-linear",
+    lora_dropout=0.0,
+    bias="none",
+)
 
 model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
 
@@ -82,6 +92,9 @@ elif args.mode == "base":
     TrainerClass = DPOTrainer
 else:
     raise ValueError(f"Invalid mode: {args.mode}")
+
+if args.use_lora:
+    model = get_peft_model(model, lora_config)
 
 model.gradient_checkpointing_enable()
 tokenizer = AutoTokenizer.from_pretrained(args.model_name)
