@@ -57,7 +57,7 @@ class FusedDPOTrainer(DPOTrainer):
             attention_mask (2B, T_completion)
             num_examples: number of examples in the batch.
         """
-        
+
         if num_examples is None:
             num_examples = hidden_states.shape[0] // 2
             assert hidden_states.shape[0] % 2 == 0
@@ -77,8 +77,8 @@ class FusedDPOTrainer(DPOTrainer):
             log_ratios.append(chunked_logdiff.sum(dim=-1) - chunked_ref_logdiff.sum(dim=-1)) # c_i
         
         log_ratios = torch.vstack(log_ratios).sum(dim=0)
-        corr_factor = (1 - torch.sigmoid(self.beta * log_ratios)) * self.beta
-        losses = torch.nn.functional.logsigmoid(log_ratios)
+        corr_factor = (torch.sigmoid(self.beta * log_ratios) - 1) * self.beta
+        losses = - torch.nn.functional.logsigmoid(log_ratios)
         return corr_factor, losses # (B, )
 
     def _cal_logdiff(self, model, hidden_states, label, attention_mask, num_examples):
