@@ -8,6 +8,7 @@ import argparse
 import time
 import csv
 from transformers.trainer_callback import TrainerCallback
+from peft import LoraConfig, get_peft_model, PeftModel
 from fused_sft_trainer import FusedSFTTrainer
 
 MAX_PAD_RATIO = 0.2
@@ -32,10 +33,10 @@ class GradientMonitorCallback(TrainerCallback):
         step = state.global_step
         print("========== step", step, "==========")
 
-        if step == 10:
+        if step == 1:
             torch.cuda.synchronize()
-            print("lm_head.weight.grad", model.lm_head.weight.grad[:5, :5])
-            print("q_proj grad", model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
+            # print("lm_head.weight.grad", model.lm_head.weight.grad[:5, :5])
+            # print("q_proj grad", model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
             print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
             print("time taken: ", time.perf_counter() - self.init_time)
 
@@ -71,6 +72,15 @@ parser.add_argument("--seq_len", type=int, default=3000)
 parser.add_argument("--num_samples", type=int, default=50, help="Number of samples to generate")
 parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model to use for training")
 parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+parser.add_argument("--use_lora", action="store_true", help="Use LoRA for training")
+
+lora_config = LoraConfig(
+    r=32,
+    lora_alpha=128,
+    target_modules="all-linear",
+    lora_dropout=0.0,
+    bias="none",
+)
 
 args = parser.parse_args()
 log_msg = f"{args.mode}, {args.model_name}, {args.seq_len}, {args.chunk_size}, "
@@ -101,6 +111,9 @@ elif args.mode == "base_no_ckpt":
     TrainerClass = Trainer
 else:
     raise ValueError(f"Invalid mode: {args.mode}")
+
+if args.use_lora:
+    model = get_peft_model(model, lora_config)
 
 training_args = SFTConfig(output_dir="sft",
                           logging_steps=10,
