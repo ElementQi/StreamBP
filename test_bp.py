@@ -4,12 +4,14 @@ import torch
 import time
 import os
 import argparse
+import csv
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--chunk_size", type=int, default=500)
 parser.add_argument("--seq_len", type=int, default=3000)
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--mode", type=str, default="stream")
+parser.add_argument("--iterations", type=int, default=1)
 args = parser.parse_args()
 
 torch.set_printoptions(precision=8)
@@ -23,7 +25,6 @@ def clean_grad(model):
 RECORD_MEMORY = False
 VOCAB_SIZE = 128256
 MAX_PAD_RATIO = 0.2
-GRAD_ACCUMULATION_STEPS = 2
 # MODEL_NAME = "Qwen/Qwen2.5-7B"
 MODEL_NAME = "Qwen/Qwen3-4B"
 
@@ -52,7 +53,7 @@ base_model.train()
 forward_model = base_model
 if args.mode == "stream":
     print("using stream model")
-    forward_model = StreamModel(base_model, gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS, logits_chunk_size=100, checkpoint_chunk_size=args.chunk_size, stream_checkpoint=True)
+    forward_model = StreamModel(base_model, gradient_accumulation_steps=args.iterations, logits_chunk_size=100, checkpoint_chunk_size=args.chunk_size, stream_checkpoint=True)
     forward_model.gradient_checkpointing_enable()
 elif args.mode == "minis":
     print("using minis model")
@@ -61,6 +62,8 @@ elif args.mode == "minis":
 elif args.mode == "base":
     print("using base model with gradient checkpointing")
     base_model.gradient_checkpointing_enable()
+elif args.mode == "base_no_ckpt":
+    print("using base model without gradient checkpointing")
 else:
     raise ValueError(f"Invalid mode: {args.mode}")
 
@@ -71,7 +74,7 @@ if RECORD_MEMORY:
 torch.cuda.synchronize()
 t1 = time.perf_counter()
 
-for i in range(GRAD_ACCUMULATION_STEPS):
+for i in range(args.iterations):
     output = forward_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -93,9 +96,13 @@ if RECORD_MEMORY:
 
 torch.cuda.synchronize()
 total_time = time.perf_counter() - t1
+per_sample_time = total_time / (args.batch_size * args.iterations)
 print("Time taken: ", total_time)
-print("Per sample time taken: ", total_time / args.batch_size)
+print("Per sample time taken: ", per_sample_time)
 print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
+
+# with open("bp_results_seqlen_time_round4.csv", "a") as f:
+#     f.write(f"{args.mode},{args.chunk_size},{args.seq_len},{args.batch_size},{args.iterations},{torch.cuda.memory_allocated() / 2**30},{torch.cuda.max_memory_allocated() / 2**30},{total_time},{per_sample_time}\n")
 
 print("loss: ", output.loss.item())
 
@@ -129,11 +136,11 @@ elif hasattr(forward_model.model, "model"):
 else:
     causal_model = forward_model
 
-# print("q_proj:")
-# print(causal_model.model.layers[0].self_attn.q_proj.weight.grad[0])
+print("q_proj:")
+print(causal_model.model.layers[0].self_attn.q_proj.weight.grad[0])
 
-# print("k_proj:")
-# print(causal_model.model.layers[0].self_attn.k_proj.weight.grad[0])
+print("k_proj:")
+print(causal_model.model.layers[0].self_attn.k_proj.weight.grad[0])
 
-# print("lm_head:")
-# print(causal_model.lm_head.weight.grad[0])
+print("lm_head:")
+print(causal_model.lm_head.weight.grad[0])
