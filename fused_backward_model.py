@@ -511,6 +511,11 @@ class StreamAttention_v2(StreamAttention):
         key_states = key_states.view(bsz, chunk_endidx, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, chunk_endidx, -1, self.head_dim).transpose(1, 2)
 
+        if hasattr(self, "q_norm"):
+            query_states = self.q_norm(query_states)
+        if hasattr(self, "k_norm"):
+            key_states = self.k_norm(key_states)
+
         t4 = time.perf_counter()
         print_time("transpose time: ", t4-t3, group='Attention')
 

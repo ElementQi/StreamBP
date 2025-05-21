@@ -25,7 +25,6 @@ def clean_grad(model):
 RECORD_MEMORY = False
 VOCAB_SIZE = 128256
 MAX_PAD_RATIO = 0.2
-# MODEL_NAME = "Qwen/Qwen2.5-7B"
 MODEL_NAME = "Qwen/Qwen3-4B"
 
 # generate data
@@ -36,10 +35,7 @@ for mask in attention_mask:
 labels = input_ids.clone()
 labels[attention_mask == 0] = -100
 
-# base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B").bfloat16().to(input_ids.device)
-# base_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B").to(input_ids.device)
-# base_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-32B").bfloat16().to(input_ids.device)
-base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).bfloat16().to(input_ids.device)
+base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(input_ids.device)
 base_model.train()
 
 # def remove_grad_hook(param):
@@ -101,7 +97,7 @@ print("Time taken: ", total_time)
 print("Per sample time taken: ", per_sample_time)
 print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
 
-# with open("bp_results_seqlen_time_round4.csv", "a") as f:
+# with open("bp_results_bz_time_round3.csv", "a") as f:
 #     f.write(f"{args.mode},{args.chunk_size},{args.seq_len},{args.batch_size},{args.iterations},{torch.cuda.memory_allocated() / 2**30},{torch.cuda.max_memory_allocated() / 2**30},{total_time},{per_sample_time}\n")
 
 print("loss: ", output.loss.item())
