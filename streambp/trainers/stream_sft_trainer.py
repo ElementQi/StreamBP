@@ -1,4 +1,4 @@
-from fused_backward_model import StreamModel
+from ..stream_model import StreamModel
 from transformers import Trainer
 
 class FusedSFTTrainer(Trainer):

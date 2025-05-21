@@ -2,7 +2,7 @@ import torch
 from trl import GRPOTrainer
 from trl.trainer.utils import selective_log_softmax
 from trl.trainer.grpo_trainer import nanmin, nanmax
-from fused_backward_model import StreamModel
+from ..stream_model import StreamModel
 from typing import Any, Callable, Optional, Union
 
 MAX_PAD_RATIO = 0.2  # Maximum ratio of padding tokens in a sequence

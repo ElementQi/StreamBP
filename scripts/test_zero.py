@@ -114,7 +114,3 @@ print(f"=========SEQLEN:{args.seq_len}, MODE:{args.mode}, GPUNUM:{world_size}===
 print(f"Process {rank} Time taken: {total_time}")
 
 print(f"Process {rank} allocated: {torch.cuda.memory_allocated() / 2**30} max allocated: {torch.cuda.max_memory_allocated() / 2**30}")
-
-# write into csv file
-with open(f"zero2_time_8B.csv", "a") as f:
-    f.write(f"{world_size},{rank},{args.seq_len},{args.mode},{args.chunk_size},{args.batch_size},{args.iterations},{torch.cuda.memory_allocated() / 2**30},{torch.cuda.max_memory_allocated() / 2**30},{total_time},{per_sample_time}\n")

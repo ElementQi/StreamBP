@@ -1,12 +1,10 @@
-# train_grpo.py
 import torch
-from datasets import load_dataset
-from trl import GRPOConfig, GRPOTrainer
-from fused_grpo_trainer import FusedGRPOTrainer, OriginalGRPOTrainer
+from trl import GRPOConfig
+from streambp.trainers.stream_grpo_trainer import FusedGRPOTrainer, OriginalGRPOTrainer
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_callback import TrainerCallback
-from fused_backward_model import StreamModel
+from streambp.stream_model import StreamModel
 import argparse
 
 torch.set_printoptions(precision=8)
@@ -21,8 +19,6 @@ class GradientMonitorCallback(TrainerCallback):
 
         step = state.global_step
         print("========== step", step, "==========")
-        print("lm_head.weight.grad", model.lm_head.weight.grad[:5, :5])
-        print("q_proj grad", model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
 
         if step == 1:
             print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
@@ -53,16 +49,15 @@ def create_dummy_dataset(args):
     return dataset
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--chunk_size", type=int, default=500)
+parser.add_argument("--chunk_size", type=int, default=3000)
 parser.add_argument("--mode", type=str, default="stream")
-parser.add_argument("--max_completion_len", type=int, default=1000, help="Sequence length for the completion")
+parser.add_argument("--max_completion_len", type=int, default=8000, help="Sequence length for the completion")
 parser.add_argument("--prompt_len", type=int, default=1000, help="Sequence length for the prompt")
 parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples to generate")
 parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model to use for training")
 parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
 args = parser.parse_args()
 
-# dataset = load_dataset("trl-lib/tldr", split="train")
 dataset = create_dummy_dataset(args)
 
 # Define the reward function, which rewards completions that are close to 20 characters

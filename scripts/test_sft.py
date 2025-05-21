@@ -2,14 +2,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer
 from datasets import load_dataset
 from trl import SFTConfig, SFTTrainer
 from datasets import Dataset
-from fused_backward_model import StreamModel
+from streambp.stream_model import StreamModel
 import torch
 import argparse
 import time
 import csv
 from transformers.trainer_callback import TrainerCallback
 from peft import LoraConfig, get_peft_model, PeftModel
-from fused_sft_trainer import FusedSFTTrainer
+from streambp.trainers.stream_sft_trainer import FusedSFTTrainer
 
 MAX_PAD_RATIO = 0.2
 torch.set_printoptions(precision=8)
@@ -35,13 +35,9 @@ class GradientMonitorCallback(TrainerCallback):
 
         if step == 1:
             torch.cuda.synchronize()
-            # print("lm_head.weight.grad", model.lm_head.weight.grad[:5, :5])
-            # print("q_proj grad", model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
             print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
             print("time taken: ", time.perf_counter() - self.init_time)
 
-            with open("sft_results.csv", "a") as f:
-                f.write(log_msg + f"{torch.cuda.memory_allocated() / 2**30}, {torch.cuda.max_memory_allocated() / 2**30}, {time.perf_counter() - self.init_time}\n")
             quit()
 
 def create_dummy_dataset(args):
@@ -66,9 +62,9 @@ def create_dummy_dataset(args):
     return dataset
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--chunk_size", type=int, default=500)
+parser.add_argument("--chunk_size", type=int, default=3000)
 parser.add_argument("--mode", type=str, default="stream")
-parser.add_argument("--seq_len", type=int, default=3000)
+parser.add_argument("--seq_len", type=int, default=9000)
 parser.add_argument("--num_samples", type=int, default=50, help="Number of samples to generate")
 parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model to use for training")
 parser.add_argument("--batch_size", type=int, default=1, help="Batch size")

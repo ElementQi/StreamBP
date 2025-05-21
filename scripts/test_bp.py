@@ -1,14 +1,12 @@
-from fused_backward_model import StreamModel, time_record
+from streambp.stream_model import StreamModel
 from transformers import AutoModelForCausalLM
 import torch
 import time
-import os
 import argparse
-import csv
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--chunk_size", type=int, default=500)
-parser.add_argument("--seq_len", type=int, default=3000)
+parser.add_argument("--chunk_size", type=int, default=3000)
+parser.add_argument("--seq_len", type=int, default=9000)
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--mode", type=str, default="stream")
 parser.add_argument("--iterations", type=int, default=1)
@@ -18,11 +16,6 @@ torch.set_printoptions(precision=8)
 torch.manual_seed(0)
 torch.cuda.manual_seed(0)
 
-def clean_grad(model):
-    for param in model.parameters():
-        param.grad = None
-
-RECORD_MEMORY = False
 VOCAB_SIZE = 128256
 MAX_PAD_RATIO = 0.2
 MODEL_NAME = "Qwen/Qwen3-4B"
@@ -38,23 +31,11 @@ labels[attention_mask == 0] = -100
 base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(input_ids.device)
 base_model.train()
 
-# def remove_grad_hook(param):
-#     def func(x):
-#         param.grad = None
-#     return func
-
-# for param in base_model.parameters():
-#     param.register_post_accumulate_grad_hook(remove_grad_hook(param))
-
 forward_model = base_model
 if args.mode == "stream":
     print("using stream model")
     forward_model = StreamModel(base_model, gradient_accumulation_steps=args.iterations, logits_chunk_size=100, checkpoint_chunk_size=args.chunk_size, stream_checkpoint=True)
     forward_model.gradient_checkpointing_enable()
-elif args.mode == "minis":
-    print("using minis model")
-    from minis.mini_sequence import minisequence
-    forward_model = minisequence(base_model, logits_chunk_size=100, chunk_size=args.chunk_size)
 elif args.mode == "base":
     print("using base model with gradient checkpointing")
     base_model.gradient_checkpointing_enable()
@@ -63,10 +44,6 @@ elif args.mode == "base_no_ckpt":
 else:
     raise ValueError(f"Invalid mode: {args.mode}")
 
-if RECORD_MEMORY:
-    torch.cuda.memory._record_memory_history(max_entries=1000000)
-
-# forward_model.gradient_checkpointing_enable()
 torch.cuda.synchronize()
 t1 = time.perf_counter()
 
@@ -84,12 +61,6 @@ for i in range(args.iterations):
     if output.loss.requires_grad:
         output.loss.backward()
     
-    # clean_grad(forward_model)
-    
-if RECORD_MEMORY:
-    torch.cuda.memory._dump_snapshot(f"test_data_model/memory_{args.mode}_cz{args.chunk_size}_seqlen{args.seq_len}.pickle")
-    torch.cuda.memory._record_memory_history(enabled=None)
-
 torch.cuda.synchronize()
 total_time = time.perf_counter() - t1
 per_sample_time = total_time / (args.batch_size * args.iterations)
@@ -97,36 +68,10 @@ print("Time taken: ", total_time)
 print("Per sample time taken: ", per_sample_time)
 print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
 
-# with open("bp_results_bz_time_round3.csv", "a") as f:
-#     f.write(f"{args.mode},{args.chunk_size},{args.seq_len},{args.batch_size},{args.iterations},{torch.cuda.memory_allocated() / 2**30},{torch.cuda.max_memory_allocated() / 2**30},{total_time},{per_sample_time}\n")
-
 print("loss: ", output.loss.item())
 
-# # Check if file exists and is empty
-# file_exists = os.path.exists("time_record.csv") and os.path.getsize("time_record.csv") > 0
-
-# if MODE == "stream" and time_record:
-#     get_avg = lambda x: sum(x) / len(x)
-#     seq_len = input_ids.size(1)
-#     values = [str(seq_len), str(CHECKPOINT_CHUNKSIZE), str(total_time), str(torch.cuda.max_memory_allocated() / 2**30)] + [str(get_avg(time_record[k])) for k in time_record.keys()]
-    
-#     with open("time_record.csv", "a") as f:
-#         if not file_exists:
-#             keys = ["SEQ_LEN", "CHECKPOINT_CHUNKSIZE", "TOTAL_TIME", "MAX_MEMORY"] + list(time_record.keys())
-#             f.write(",".join(keys) + "\n")
-#         f.write(",".join(values) + "\n")
-
-# else:
-#     print("No time record data available")
-
-
-# print(forward_model.lm_head.weight.grad[0])
-
-# minis
-if hasattr(forward_model, "module"):
-    causal_model = forward_model.module
 # stream
-elif hasattr(forward_model.model, "model"):
+if hasattr(forward_model.model, "model"):
     causal_model = forward_model.model
 # base
 else:

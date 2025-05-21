@@ -731,7 +731,7 @@ class StreamModel(torch.nn.Module):
             global_dict["zero2_optimizer"].process_gradients = lambda *args, **kwargs: None
 
         if attention_mask is not None:
-            print("Set the attention mask to None for memory efficiency") # TODO: make it more elegant
+            # print("Set the attention mask to None for memory efficiency") # TODO: make it more elegant
             attention_mask = None
 
         if (not self.training) or (not torch.is_grad_enabled()):

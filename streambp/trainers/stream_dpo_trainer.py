@@ -1,5 +1,5 @@
 from trl import DPOConfig, DPOTrainer
-from fused_backward_model import StreamModel
+from ..stream_model import StreamModel
 import torch
 import torch.nn as nn
 from typing import Any, Union
