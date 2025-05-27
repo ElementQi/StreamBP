@@ -87,7 +87,7 @@ class FusedDPOTrainer(DPOTrainer):
         logps = logps * attention_mask
         chosen_logps = logps[:num_examples]
         rejected_logps = logps[num_examples:]
-        return chosen_logps - rejected_logps # (B, )
+        return chosen_logps - rejected_logps # (B, T)
 
     def _fused_dpo_backward_single_example(self, model, inputs):
         """

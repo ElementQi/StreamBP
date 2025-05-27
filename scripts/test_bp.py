@@ -25,10 +25,12 @@ input_ids = torch.randint(0, VOCAB_SIZE, (args.batch_size, args.seq_len)).cuda()
 attention_mask = torch.ones_like(input_ids).cuda()
 for mask in attention_mask:
     mask[-torch.randint(1, int(args.seq_len*MAX_PAD_RATIO), (1,)):] = 0
+    mask[:torch.randint(1, int(args.seq_len*MAX_PAD_RATIO), (1,))] = 0
 labels = input_ids.clone()
 labels[attention_mask == 0] = -100
 
-base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(input_ids.device)
+# base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(input_ids.device)
+base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float32).to(input_ids.device)
 base_model.train()
 
 forward_model = base_model
@@ -69,6 +71,11 @@ print("Per sample time taken: ", per_sample_time)
 print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
 
 print("loss: ", output.loss.item())
+
+# import csv
+# with open("paper_results/bp_results_seqlen_time_normcorrected.csv", "a") as f:
+#     writer = csv.writer(f)
+#     writer.writerow([args.mode, args.chunk_size, args.seq_len, args.batch_size, total_time, per_sample_time, torch.cuda.memory_allocated() / 2**30, torch.cuda.max_memory_allocated() / 2**30, output.loss.item()])
 
 # stream
 if hasattr(forward_model.model, "model"):

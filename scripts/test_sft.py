@@ -32,6 +32,8 @@ class GradientMonitorCallback(TrainerCallback):
 
         step = state.global_step
         print("========== step", step, "==========")
+        print(model.lm_head.weight.grad[:5, :5])
+        print(model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
 
         if step == 1:
             torch.cuda.synchronize()
@@ -82,6 +84,7 @@ args = parser.parse_args()
 log_msg = f"{args.mode}, {args.model_name}, {args.seq_len}, {args.chunk_size}, "
 
 base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+# base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32)
 
 base_model.train()
 dataset = create_dummy_dataset(args)

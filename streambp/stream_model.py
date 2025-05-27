@@ -13,28 +13,11 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import check_backward_validity, _infer_device_type, _get_autocast_kwargs, _get_device_module, get_device_states, detach_variable
-import time
-import gc
-import random
 
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
-verbose=0
-selected_group = ["Attention"]
-time_record = {}
-measure_time = False
 global_dict = {}
-
-def print_time(msg, time, group=""):
-    if selected_group is not None and group not in selected_group:
-        return
-    if verbose > 0:
-        print(f"[{group}]:", msg, time)
-    time_record[f"[{group}] {msg}"] = time_record.get(f"[{group}] {msg}", list()) + [time]
-
-def sync_cuda():
-    if measure_time:
-        torch.cuda.synchronize()
+stream_buffer = {}
 
 def apply_rotary_pos_emb(states, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -120,13 +103,9 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
         hidden_states_grad = args[0] # unpack args
         num_chunks = math.ceil(hidden_states_grad.size(1) / ctx.chunk_size)
 
-        forward_time = 0
-        backward_time = 0
-
         if "zero2_optimizer" in global_dict:
             global_dict["zero2_optimizer"].process_gradients = lambda *args, **kwargs: None
 
-        # print("run_function: ", ctx.run_function)
         for i in range(num_chunks):
             start = i * ctx.chunk_size
             end = min((i+1)*ctx.chunk_size, hidden_states_grad.size(1))
@@ -135,20 +114,11 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
                 global_dict["zero2_optimizer"].process_gradients = global_dict["zero2_gradient_process_func"]
             # torch.cuda.memory._record_memory_history(max_entries=1000000)
             with torch.enable_grad():
-                sync_cuda()
-                t1 = time.perf_counter()
                 outputs = ctx.run_function(*detached_inputs, chunk_range=(start, end)) # TODO: make it more elegant
-                sync_cuda()
-                chunk_forward_time = time.perf_counter() - t1
-                forward_time += chunk_forward_time
-                print_time(f"chunked forward time: ", chunk_forward_time, group="Checkpoint")
-                # print_time(f"chunked forward time {i+1}/{num_chunks}: ", chunk_forward_time, group="Checkpoint")
                 if isinstance(outputs, tuple):
                     hidden_states = outputs[0]
                 else:
                     hidden_states = outputs
-                sync_cuda()
-                t2 = time.perf_counter()
                 torch.autograd.backward(
                         hidden_states,
                         grad_tensors=hidden_states_grad[:, start:end, :].detach(), 
@@ -157,19 +127,12 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
 
                 # torch.cuda.memory._dump_snapshot(f"test_data_model/memory_record_checkpoint.pickle")
                 # torch.cuda.memory._record_memory_history(enabled=None)
-                sync_cuda()
-                chunk_backward_time = time.perf_counter() - t2
-                backward_time += chunk_backward_time
-            print_time(f"chunked backward time: ", chunk_backward_time, group="Checkpoint")
-            # print_time(f"chunked backward time {i+1}/{num_chunks}: ", chunk_backward_time, group="Checkpoint")
 
         grads = tuple(
             inp.grad if isinstance(inp, torch.Tensor) else None
             for inp in detached_inputs
         ) # TODO: check why this line reduces memory
 
-        print_time(f"forward time", forward_time, group="Checkpoint")
-        print_time(f"backward time", backward_time, group="Checkpoint")
         return (None, None) + grads
 
 class StreamMLP(nn.Module):
@@ -243,8 +206,6 @@ class StreamDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
-        sync_cuda()
-        t1 = time.perf_counter()
 
         residual = hidden_states
         
@@ -252,9 +213,6 @@ class StreamDecoderLayer(nn.Module):
             residual = hidden_states[:, chunk_range[0]:chunk_range[1], :]
 
         hidden_states = self.input_layernorm(hidden_states)
-        sync_cuda()
-        t2 = time.perf_counter()
-        print_time("input layernorm: ", t2-t1, group="DecoderLayer")
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -268,25 +226,14 @@ class StreamDecoderLayer(nn.Module):
             chunk_range=chunk_range,
             **kwargs,
         )
-        sync_cuda()
-        t3 = time.perf_counter()
-        print_time("self attn: ", t3-t2, group="DecoderLayer")
 
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        sync_cuda()
-        t4 = time.perf_counter()
-        print_time("post attn layernorm: ", t4-t3, group="DecoderLayer")
-
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         
-        sync_cuda()
-        t5 = time.perf_counter()
-        print_time("mlp: ", t5-t4, group="DecoderLayer")
-        # hidden_states = residual + hidden_states
         outputs = (hidden_states,)
 
         if output_attentions:
@@ -295,8 +242,6 @@ class StreamDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
-        sync_cuda()
-        print_time("total time: ", time.perf_counter()-t1, group="DecoderLayer")
         return outputs
 
 
@@ -343,8 +288,6 @@ class StreamAttention(torch.nn.Module):
         else:
             chunk_startidx, chunk_endidx, chunk_len = 0, q_len, q_len
 
-        sync_cuda()
-        t1 = time.perf_counter()
         # Cache key and value states for chunked processing
         # self._maybe_cache_key_value_states(hidden_states)
         
@@ -354,14 +297,9 @@ class StreamAttention(torch.nn.Module):
         
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-        # print("k v compute time: ", time.perf_counter() - t1)
-
         # Only compute query states for the current chunk
         query_states = self.q_proj(hidden_states[:, chunk_startidx:chunk_endidx, :])
 
-        sync_cuda()
-        t2 = time.perf_counter()
-        print_time("q projection time: ", t2-t1, group='Attention')
         # Compute RoPE embeddings efficiently
         if position_embeddings is None:
             logger.warning_once(
@@ -374,15 +312,7 @@ class StreamAttention(torch.nn.Module):
         else:
             cos, sin = position_embeddings
 
-        sync_cuda()
-        t3 = time.perf_counter()
-        print_time("rope time: ", t3-t2, group='Attention')
-
         query_states = query_states.view(bsz, chunk_len, -1, self.head_dim).transpose(1, 2)
-
-        sync_cuda()
-        t4 = time.perf_counter()
-        # print_time("q projection time: ", t4-t3, group='Attention')
 
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
@@ -391,9 +321,6 @@ class StreamAttention(torch.nn.Module):
         key_states = apply_rotary_pos_emb(key_states, cos, sin)
         query_states = apply_rotary_pos_emb(query_states, cos[:, chunk_startidx:chunk_endidx], sin[:, chunk_startidx:chunk_endidx])
 
-        sync_cuda()
-        t5 = time.perf_counter()
-        print_time("apply rope time: ", t5-t4, group='Attention')
         # TODO: check the meaning of this section
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -422,9 +349,6 @@ class StreamAttention(torch.nn.Module):
 
         causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :]
 
-        sync_cuda()
-        t6 = time.perf_counter()
-        print_time("pre attn time: ", t6-t5, group='Attention')
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
@@ -434,17 +358,9 @@ class StreamAttention(torch.nn.Module):
             is_causal=is_causal,
         )
 
-        sync_cuda()
-        t7 = time.perf_counter()
-        print_time("attn time: ", t7-t6, group='Attention')
-
         attn_output = attn_output.transpose(1, 2).contiguous() # TODO: check
         attn_output = attn_output.view(bsz, chunk_len, -1)
         attn_output = self.o_proj(attn_output)
-
-        sync_cuda()
-        t8 = time.perf_counter()
-        print_time("o projection time: ", t8-t7, group='Attention')
 
         # clearn cache when the last chunk is processed
         if chunk_endidx >= q_len:
@@ -454,7 +370,14 @@ class StreamAttention(torch.nn.Module):
 
 class StreamAttention_v2(StreamAttention):
     def __init__(self, self_attn):
-        super().__init__(self_attn)
+        super().__init__(self_attn) # TODO: incorporate v2 into StreamAttention
+        self._setup_stream_buffer()
+
+    def _setup_stream_buffer(self):
+        for model in stream_buffer:
+            if any(m is self.self_attn for m in model.modules()):
+                self.stream_buffer = stream_buffer[model]
+                return
 
     def forward(
         self,
@@ -479,18 +402,12 @@ class StreamAttention_v2(StreamAttention):
         else:
             chunk_startidx, chunk_endidx, chunk_len = 0, q_len, q_len
 
-        sync_cuda()
-        t1 = time.perf_counter()
-
         key_states = self.k_proj(hidden_states[:, :chunk_endidx, :])
         value_states = self.v_proj(hidden_states[:, :chunk_endidx, :])
 
         # Only compute query states for the current chunk
         query_states = self.q_proj(hidden_states[:, chunk_startidx:chunk_endidx, :])
 
-        sync_cuda()
-        t2 = time.perf_counter()
-        # print_time("projection time: ", t2-t1, group='Attention')
         # Compute RoPE embeddings efficiently
         if position_embeddings is None:
             logger.warning_once(
@@ -503,9 +420,6 @@ class StreamAttention_v2(StreamAttention):
         else:
             cos, sin = position_embeddings
 
-        t3 = time.perf_counter()
-        print_time("rope time: ", t3-t2, group='Attention')
-
         query_states = query_states.view(bsz, chunk_len, -1, self.head_dim).transpose(1, 2)
 
         key_states = key_states.view(bsz, chunk_endidx, -1, self.head_dim).transpose(1, 2)
@@ -516,17 +430,11 @@ class StreamAttention_v2(StreamAttention):
         if hasattr(self, "k_norm"):
             key_states = self.k_norm(key_states)
 
-        t4 = time.perf_counter()
-        print_time("transpose time: ", t4-t3, group='Attention')
-
         # Apply RoPE efficiently
         key_states = apply_rotary_pos_emb(key_states, cos[:, :chunk_endidx], sin[:, :chunk_endidx])
 
         query_states = apply_rotary_pos_emb(query_states, cos[:, chunk_startidx:chunk_endidx], sin[:, chunk_startidx:chunk_endidx])
 
-        sync_cuda()
-        t5 = time.perf_counter()
-        print_time("apply rope time: ", t5-t4, group='Attention')
         # TODO: check the meaning of this section
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -558,21 +466,16 @@ class StreamAttention_v2(StreamAttention):
         # if causal_mask is not None:
         #     causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :] # TODO: handle the case where causal_mask is None
 
-        sync_cuda()
-        t6 = time.perf_counter()
-        # print_time("pre attn time: ", t6-t5, group='Attention')
-
         # TODO: check corner case
         if query_states.shape[2] == 1 and causal_mask is None:
             # Generation mode, the new state will attend to all the previous states
             is_causal = False
-        elif chunk_startidx <= 0:
-            # For the first chunk, we use the default causal mask
+        elif self.stream_buffer["attention_mask"] is None:
             causal_mask = None
             is_causal = True
         else:
-            # TODO: add mask generation for given attention mask
-            causal_mask = self._generate_causal_mask(chunk_startidx, chunk_endidx, bsz, query_states.dtype, query_states.device)
+            # causal_mask = self._generate_causal_mask(chunk_startidx, chunk_endidx, bsz, query_states.dtype, query_states.device)
+            causal_mask = self._generate_causal_mask_v3(chunk_startidx, chunk_endidx, query_states.dtype, query_states.device)
             is_causal = False
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -585,18 +488,27 @@ class StreamAttention_v2(StreamAttention):
             is_causal=is_causal,
         )
 
-        sync_cuda()
-        t7 = time.perf_counter()
-        # print_time("attn time: ", t7-t6, group='Attention')
         attn_output = attn_output.transpose(1, 2).contiguous() # TODO: check
         attn_output = attn_output.view(bsz, chunk_len, -1)
         attn_output = self.o_proj(attn_output)
 
-        sync_cuda()
-        t8 = time.perf_counter()
-        # print_time("o projection time: ", t8-t7, group='Attention')
-
         return attn_output, None, past_key_value
+
+    def _generate_causal_mask_v3(self, chunk_startidx, chunk_endidx, dtype, device):
+        sub_attention_mask = self.stream_buffer["attention_mask"][:, :chunk_endidx]
+        batch_size = sub_attention_mask.shape[0]
+
+        min_dtype = torch.finfo(dtype).min
+        chunk_len = chunk_endidx - chunk_startidx
+        mask_1 = torch.zeros(chunk_len, chunk_startidx, dtype=dtype, device=device)
+        mask_2 = torch.full((chunk_len, chunk_len), fill_value=min_dtype, dtype=dtype, device=device).triu(diagonal=1)
+        causal_mask = torch.cat([mask_1, mask_2], dim=1).expand(batch_size, 1, -1, -1)
+
+        for i in range(batch_size):
+            zero_col_indices = torch.where(sub_attention_mask[i] == 0)[0]
+            causal_mask[i, :, :, zero_col_indices] = min_dtype
+
+        return causal_mask
 
     def _generate_causal_mask(self, chunk_startidx, chunk_endidx, batch_size, dtype, device):
         min_dtype = torch.finfo(dtype).min
@@ -640,12 +552,29 @@ class StreamModel(torch.nn.Module):
 
         # enable transformer layer to forward in chunk mode, i.e. calculate the query states
         # of a particular chunk (NOTE: the key and value states are still calculated for the whole sequence)
+        self._setup_stream_buffer()
         self._setup_stream_forward()
         self._setup_gradient_accumulation()
 
         # if stream_checkpoint:
         #     # when calculating the gradient for a checkpointed layer, re-forward and backward in stream mode
         #     self.gradient_checkpointing_enable(checkpoint_chunk_size=checkpoint_chunk_size)
+
+    def _setup_stream_buffer(self):
+        if self not in stream_buffer:
+            stream_buffer[self] = {}
+        self.stream_buffer = stream_buffer[self]
+
+        # set up base model's stream buffer
+        base_model = self.get_base_model(self.model)
+        base_model.stream_buffer = self.stream_buffer
+        def _attention_mask_recording_wrapper(func, *args, **kwargs):
+            def wrapped_func(*args, **kwargs):
+                if "attention_mask" in kwargs and kwargs["attention_mask"] is not None:
+                    self.stream_buffer["attention_mask"] = kwargs["attention_mask"]
+                return func(*args, **kwargs)
+            return wrapped_func
+        base_model.forward = _attention_mask_recording_wrapper(base_model.forward)
 
     def _setup_stream_forward(self):
         # TODO: add check for layer type
@@ -656,6 +585,17 @@ class StreamModel(torch.nn.Module):
     def _setup_gradient_accumulation(self):
         self._cur_gradient_accumulation_step = 0
         self._valid_pos_num = 0
+
+    def get_base_model(self, model):
+        is_base_model = False
+        while not is_base_model:
+            for attr in ["model", "base_model", "module"]:
+                if hasattr(model, attr) and not (getattr(model, attr) is model):
+                    model = getattr(model, attr)
+                else:
+                    is_base_model = True
+                    break
+        return model
 
     def __getattr__(self, name):
         """inherit attributes from model"""
@@ -731,7 +671,8 @@ class StreamModel(torch.nn.Module):
             global_dict["zero2_optimizer"].process_gradients = lambda *args, **kwargs: None
 
         if attention_mask is not None:
-            # print("Set the attention mask to None for memory efficiency") # TODO: make it more elegant
+            self.stream_buffer["attention_mask"] = attention_mask
+            # avoid creating a T by T mask. Only generate the attention mask of the partition during self-attention
             attention_mask = None
 
         if (not self.training) or (not torch.is_grad_enabled()):
@@ -760,7 +701,6 @@ class StreamModel(torch.nn.Module):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         model = self.model # the causal model
  
-        t1 = time.perf_counter()
         outputs = model.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -774,7 +714,6 @@ class StreamModel(torch.nn.Module):
             cache_position=cache_position,
             **kwargs,
         )
-        print("base model time: ", time.perf_counter() - t1)
         hidden_states = outputs[0]
         B, T, C = hidden_states.size()
 
@@ -800,21 +739,20 @@ class StreamModel(torch.nn.Module):
                 continue
 
             loss_chunk = model.loss_function(logits=logits_chunk, labels=labels_chunk, vocab_size=model.config.vocab_size) * chunk_valid_posnum
-            # TODO: use block wise gradient accumulation for avoiding storing two copies of lm_head's gradient
-            # loss_chunk.backward()
-            loss_chunk.backward(inputs=[detached_hidden_states, logits_chunk])
+            loss_chunk.backward()
+            # loss_chunk.backward(inputs=[detached_hidden_states, logits_chunk])
 
-            # This helps avoids storing two copies of lm_head's gradient
-            # When using ZeRO-2, lm_head's gradient will be reduced in the end of backward pass, i.e. in _backward_epilogue function function
-            with torch.no_grad():
-                logits_chunk_grad = logits_chunk.grad.view(-1, model.config.vocab_size).T
-                logits_chunk_grad = logits_chunk_grad.to(model.lm_head.weight.grad.dtype)
-                model.lm_head.weight.grad.addmm_(
-                    logits_chunk_grad,
-                    detached_hidden_states[:, start:end, :].reshape(-1, C),
-                )
+            # # This helps avoids storing two copies of lm_head's gradient
+            # # When using ZeRO-2, lm_head's gradient will be reduced in the end of backward pass, i.e. in _backward_epilogue function function
+            # with torch.no_grad():
+            #     logits_chunk_grad = logits_chunk.grad.view(-1, model.config.vocab_size).T
+            #     logits_chunk_grad = logits_chunk_grad.to(model.lm_head.weight.grad.dtype)
+            #     model.lm_head.weight.grad.addmm_(
+            #         logits_chunk_grad,
+            #         detached_hidden_states[:, start:end, :].reshape(-1, C),
+            #     )
 
-            del logits_chunk.grad
+            # del logits_chunk.grad
             del logits_chunk
             loss += loss_chunk.detach()
 
@@ -824,10 +762,11 @@ class StreamModel(torch.nn.Module):
         # detached_hidden_states.grad.div_(batch_valid_posnum)
         # model.lm_head.weight.grad.div_(batch_valid_posnum)
 
-        with torch.amp.autocast(device_type="cuda", enabled=False):
-            # If enabled, gradient of bf16 operator related weights will not be computed.
-            # TODO: figure out why and check if there slows down the backward
-            torch.autograd.backward(hidden_states, grad_tensors=detached_hidden_states.grad.detach())
+        # with torch.amp.autocast(device_type="cuda", enabled=False):
+        #     # If enabled, gradient of bf16 operator related weights will not be computed.
+        #     # TODO: figure out why and check if there slows down the backward
+        #     torch.autograd.backward(hidden_states, grad_tensors=detached_hidden_states.grad.detach())
+        torch.autograd.backward(hidden_states, grad_tensors=detached_hidden_states.grad.detach())
         
         detached_hidden_states.grad = None
 

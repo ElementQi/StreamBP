@@ -19,6 +19,8 @@ class GradientMonitorCallback(TrainerCallback):
 
         step = state.global_step
         print("========== step", step, "==========")
+        print(model.lm_head.weight.grad[:5, :5])
+        print(model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
 
         if step == 1:
             print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
@@ -73,6 +75,7 @@ training_args = GRPOConfig(output_dir="Qwen2.5-0.5B-GRPO",
                            max_completion_length=args.max_completion_len,
                            )
 model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+# model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32)
 
 if args.mode == "stream":
     model = StreamModel(model, gradient_accumulation_steps=1, logits_chunk_size=100, stream_checkpoint=True, checkpoint_chunk_size=args.chunk_size)

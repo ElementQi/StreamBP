@@ -2,7 +2,7 @@ import torch
 import deepspeed
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.optim import AdamW  # Import optimizer
-from fused_backward_model import StreamModel, global_dict
+from streambp.stream_model import StreamModel, global_dict
 import time
 import argparse
 import logging
@@ -93,7 +93,7 @@ t1 = time.perf_counter()
 if isinstance(model, StreamModel) and model.stream_checkpoint and args.zero_stage >= 2:
     global_dict["zero2_optimizer"] = optimizer
 
-for _ in range(args.iterations):
+for i in range(args.iterations):
     outputs = model_engine(input_ids=local_input_ids, labels=local_labels, attention_mask=local_attention_mask)
     loss = outputs.loss
     if loss.requires_grad:
@@ -103,6 +103,13 @@ for _ in range(args.iterations):
         # for stream model; gradients are already computed during the forward pass
         model_engine._backward_epilogue() # reduce and release the ipg grads
 
+    causal_model = model_engine.model if args.mode == "stream" else model_engine
+    lm_head_grad = deepspeed.utils.safe_get_full_grad(causal_model.lm_head.weight)
+    q_grad = deepspeed.utils.safe_get_full_grad(causal_model.model.layers[0].self_attn.q_proj.weight)
+    if rank == 0:
+        print("========== step", i, "==========")
+        print(lm_head_grad[:5, :5])
+        print(q_grad[:5, :5])
     # need to use engine.step for correctly preparing the averaged gradients
     model_engine.step()
 
