@@ -10,7 +10,10 @@ parser.add_argument("--seq_len", type=int, default=9000)
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--mode", type=str, default="stream")
 parser.add_argument("--iterations", type=int, default=1)
+parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B")
 args = parser.parse_args()
+
+print(f"Mode: {args.mode}, Chunk size: {args.chunk_size}, Seq len: {args.seq_len}, Batch size: {args.batch_size}, Model name: {args.model_name}")
 
 torch.set_printoptions(precision=8)
 torch.manual_seed(0)
@@ -18,33 +21,27 @@ torch.cuda.manual_seed(0)
 
 VOCAB_SIZE = 128256
 MAX_PAD_RATIO = 0.2
-MODEL_NAME = "Qwen/Qwen3-4B"
 
 # generate data
 input_ids = torch.randint(0, VOCAB_SIZE, (args.batch_size, args.seq_len)).cuda()
 attention_mask = torch.ones_like(input_ids).cuda()
 for mask in attention_mask:
     mask[-torch.randint(1, int(args.seq_len*MAX_PAD_RATIO), (1,)):] = 0
-    mask[:torch.randint(1, int(args.seq_len*MAX_PAD_RATIO), (1,))] = 0
+    # mask[:torch.randint(1, int(args.seq_len*MAX_PAD_RATIO), (1,))] = 0
 labels = input_ids.clone()
 labels[attention_mask == 0] = -100
 
-# base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(input_ids.device)
-base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float32).to(input_ids.device)
+base_model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32).to(input_ids.device)
 base_model.train()
 
 forward_model = base_model
 if args.mode == "stream":
-    print("using stream model")
     forward_model = StreamModel(base_model, gradient_accumulation_steps=args.iterations, logits_chunk_size=100, checkpoint_chunk_size=args.chunk_size, stream_checkpoint=True)
     forward_model.gradient_checkpointing_enable()
 elif args.mode == "base":
-    print("using base model with gradient checkpointing")
     base_model.gradient_checkpointing_enable()
-elif args.mode == "base_no_ckpt":
-    print("using base model without gradient checkpointing")
 else:
-    raise ValueError(f"Invalid mode: {args.mode}")
+    assert args.mode == "base_no_ckpt", f"Invalid mode: {args.mode}, must be one of: stream, base, base_no_ckpt"
 
 torch.cuda.synchronize()
 t1 = time.perf_counter()

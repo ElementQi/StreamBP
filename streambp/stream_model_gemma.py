@@ -449,7 +449,7 @@ class StreamAttention(torch.nn.Module):
         mask = torch.cat([mask_1, mask_2], dim=1).expand(batch_size, 1, -1, -1)
         return mask
 
-class StreamModel(torch.nn.Module):
+class StreamModelForGemma(torch.nn.Module):
     def __init__(self, model: PreTrainedModel, gradient_accumulation_steps, gradient_accumulation_mode="sum", logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
         """ The StreamModel class wraps the original model to save the memory usage. """
         super().__init__()

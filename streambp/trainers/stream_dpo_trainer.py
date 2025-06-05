@@ -29,7 +29,7 @@ def get_causal_model(model):
                 break
     return model
 
-class FusedDPOTrainer(DPOTrainer):
+class StreamDPOTrainer(DPOTrainer):
     def __init__(
             self, *args, **kwargs
         ) -> None:

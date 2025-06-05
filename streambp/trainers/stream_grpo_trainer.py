@@ -44,11 +44,11 @@ class OriginalGRPOTrainer(GRPOTrainer):
 
         return batched_inputs
 
-class FusedGRPOTrainer(GRPOTrainer):
+class StreamGRPOTrainer(GRPOTrainer):
     def __init__(
             self, *args, **kwargs
         ) -> None:
-        assert isinstance(kwargs["model"], StreamModel), "model must be a StreamModel"
+        # assert isinstance(kwargs["model"], StreamModel), "model must be a StreamModel"
         self.chunk_size = kwargs["model"].logits_chunk_size
         self.vocab_size = kwargs["model"].model.lm_head.out_features
         self.max_completion_length = kwargs.pop("max_completion_length") # NOTE: for generating dummy data only; to delete after testing

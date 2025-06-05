@@ -3,7 +3,7 @@ from trl import DPOConfig, DPOTrainer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_callback import TrainerCallback
 from streambp.stream_model import StreamModel
-from streambp.trainers.stream_dpo_trainer import FusedDPOTrainer
+from streambp.trainers.stream_dpo_trainer import StreamDPOTrainer
 from peft import LoraConfig, get_peft_model, PeftModel
 import argparse
 from datasets import Dataset
@@ -26,7 +26,7 @@ class GradientMonitorCallback(TrainerCallback):
         print(model.lm_head.weight.grad[:5, :5])
         print(model.model.layers[0].self_attn.q_proj.weight.grad[:5, :5])
 
-        if step == 1:
+        if step == 0:
             print("allocated: ", torch.cuda.memory_allocated() / 2**30, "max allocated: ", torch.cuda.max_memory_allocated() / 2**30)
             quit()
 
@@ -71,12 +71,12 @@ lora_config = LoraConfig(
     bias="none",
 )
 
-model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
-# model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32)
+# model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float32)
 
 if args.mode == "stream":
     model = StreamModel(model, gradient_accumulation_steps=1, logits_chunk_size=100, stream_checkpoint=True, checkpoint_chunk_size=args.chunk_size)
-    TrainerClass = FusedDPOTrainer
+    TrainerClass = StreamDPOTrainer
 elif args.mode == "base":
     TrainerClass = DPOTrainer
 else:

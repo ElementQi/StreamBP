@@ -89,7 +89,7 @@ local_labels = local_labels.to(model.device)
 torch.cuda.synchronize()
 t1 = time.perf_counter()
 
-# get the reference of the optimizer in the fused_backward_model.py
+# get the reference of the optimizer in the stream_model.py
 if isinstance(model, StreamModel) and model.stream_checkpoint and args.zero_stage >= 2:
     global_dict["zero2_optimizer"] = optimizer
 

@@ -87,7 +87,6 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
-        # import debugpy; debugpy.debug_this_thread()
         # Copy the list to avoid modifying original list.
         inputs = list(ctx.inputs)
         tensor_indices = ctx.tensor_indices
@@ -112,7 +111,6 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
 
             if (i == num_chunks - 1) and "zero2_optimizer" in global_dict:
                 global_dict["zero2_optimizer"].process_gradients = global_dict["zero2_gradient_process_func"]
-            # torch.cuda.memory._record_memory_history(max_entries=1000000)
             with torch.enable_grad():
                 outputs = ctx.run_function(*detached_inputs, chunk_range=(start, end)) # TODO: make it more elegant
                 if isinstance(outputs, tuple):
@@ -125,8 +123,6 @@ class CheckpointFunctionForStreamBackward(torch.autograd.Function):
                         retain_graph=True if end < hidden_states_grad.size(1) else False
                     )
 
-                # torch.cuda.memory._dump_snapshot(f"test_data_model/memory_record_checkpoint.pickle")
-                # torch.cuda.memory._record_memory_history(enabled=None)
 
         grads = tuple(
             inp.grad if isinstance(inp, torch.Tensor) else None
@@ -349,9 +345,6 @@ class StreamAttention(torch.nn.Module):
 
         # causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :]
 
-        # if causal_mask is not None:
-        #     causal_mask = causal_mask[:, :, chunk_startidx:chunk_endidx, :] # TODO: handle the case where causal_mask is None
-
         # TODO: check corner case
         if query_states.shape[2] == 1 and causal_mask is None:
             # Generation mode, the new state will attend to all the previous states
@@ -360,8 +353,7 @@ class StreamAttention(torch.nn.Module):
             causal_mask = None
             is_causal = True
         else:
-            # causal_mask = self._generate_causal_mask(chunk_startidx, chunk_endidx, bsz, query_states.dtype, query_states.device)
-            causal_mask = self._generate_causal_mask_v3(chunk_startidx, chunk_endidx, query_states.dtype, query_states.device)
+            causal_mask = self._generate_causal_mask(chunk_startidx, chunk_endidx, query_states.dtype, query_states.device)
             is_causal = False
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -380,7 +372,7 @@ class StreamAttention(torch.nn.Module):
 
         return attn_output, None, past_key_value
 
-    def _generate_causal_mask_v3(self, start_idx, end_idx, dtype, device):
+    def _generate_causal_mask(self, start_idx, end_idx, dtype, device):
         # TODO: handle sliding window attention
         sub_attention_mask = self.stream_buffer["attention_mask"][:, :end_idx]
         batch_size = sub_attention_mask.shape[0]
@@ -398,35 +390,6 @@ class StreamAttention(torch.nn.Module):
         # causal_mask.mul(~torch.all(causal_mask == min_dtype, dim=-1, keepdim=True))
 
         return causal_mask
-
-    def _generate_causal_mask(self, chunk_startidx, chunk_endidx, batch_size, dtype, device):
-        min_dtype = torch.finfo(dtype).min
-        if chunk_startidx == 0:
-            return torch.full((chunk_endidx, chunk_endidx), fill_value=min_dtype, dtype=dtype, device=device).triu(diagonal=1)
-
-        chunk_len = chunk_endidx - chunk_startidx
-        mask_1 = torch.zeros(chunk_len, chunk_startidx, dtype=dtype, device=device)
-        mask_2 = torch.full((chunk_len, chunk_len), fill_value=min_dtype, dtype=dtype, device=device).triu(diagonal=1)
-
-        mask = torch.cat([mask_1, mask_2], dim=1).expand(batch_size, 1, -1, -1)
-        return mask
-
-    def _generate_causal_mask_v2(self, chunk_startidx, chunk_endidx, batch_size, dtype, device):
-        if chunk_startidx == 0:
-            # For the first chunk, create a standard causal mask (upper triangular with False values)
-            mask = torch.ones((chunk_endidx, chunk_endidx), dtype=torch.bool, device=device)
-            mask = mask.tril(diagonal=0)  # Lower triangular including diagonal is True
-            return mask
-
-        chunk_len = chunk_endidx - chunk_startidx
-        # All positions in the history can be attended to
-        mask_1 = torch.ones(chunk_len, chunk_startidx, dtype=torch.bool, device=device)
-        # For the current chunk, create a causal mask
-        mask_2 = torch.ones((chunk_len, chunk_len), dtype=torch.bool, device=device).tril(diagonal=0)
-
-        # Concatenate and expand for batch dimension
-        mask = torch.cat([mask_1, mask_2], dim=1).expand(batch_size, 1, -1, -1)
-        return mask
 
 class StreamModel(torch.nn.Module):
     def __init__(self, model: PreTrainedModel, gradient_accumulation_steps, gradient_accumulation_mode="sum", logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
