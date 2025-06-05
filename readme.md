@@ -1,6 +1,6 @@
 Code for [StreamBP: Memory-Efficient Exact Backpropagation for Long Sequence Training of LLMs](https://arxiv.org/abs/2506.03077).
 
-StreamBP substantially reduces the memory cost of activation values and scales up the maximum sequence length by 2.8-5.5$\times$ larger than gradient checkpointing, while using similar or even less BP time.
+StreamBP substantially reduces the memory cost of activation values and scales up the maximum sequence length by 2.8-5.5 $\times$ larger than gradient checkpointing, while using similar or even less BP time.
 
 **Note:** This codebase is under active development; feel free to raise any issues you encountered. We are also accepting feature requests.
 
@@ -13,11 +13,10 @@ StreamBP substantially reduces the memory cost of activation values and scales u
 
 ### Features
 * **Verified model class**: Qwen-2.5/3, Llama-3/3.1/3.2, Phi-3/4, Gemma.
-
-> [!NOTE]
-> The code is applicable to general transformer model classes and is not restricted to the aforementioned model classes. However, due to different architecture design (e.g. normalization), the current implementation may induce incorrect gradient computation. We are actively testing and incoporating different model classes.
 * **Various objectives**: SFT, GRPO, DPO.
 * **Distributed training**: Deepspeed ZeRO stage 1 & 2.
+> [!NOTE]
+> The code is applicable to general transformer model classes and is not restricted to the aforementioned model classes. However, due to different architecture design (e.g. normalization), the current implementation may induce incorrect gradient computation. We are actively testing and incoporating different model classes.
 
 ### Setup
 Setup the environment by the following commands:
@@ -27,8 +26,8 @@ conda activate streambp
 pip install streambp
 pip install -r requirements.txt
 ```
-
-**Note**: The gradient calculation of other `transformer` and `trl` versions may be different and leads to incorrect result. We are actively developing the repository and will release a more stable implementation later.
+> [!NOTE]
+> The gradient calculation of other `transformer` and `trl` versions may be different and leads to incorrect result. We are actively developing the repository and will release a more stable implementation later.
 
 ### Reproduce StreamBP
 Paper results can be reproduced by the scripts under `scripts` folder.
@@ -56,7 +55,8 @@ python scripts/test_dpo.py --mode base --seq_len 15000 --model_name Qwen/Qwen3-8
 python scripts/test_grpo.py --mode stream --seq_len 15000 --chunk_size 5000 --model_name Qwen/Qwen3-8B # StreamBP
 python scripts/test_grpo.py --mode base --seq_len 15000 --model_name Qwen/Qwen3-8B # Gradient checkpointing
 ```
-**Note:** The above experiments should be run on a single GPU (i.e. `export CUDA_VISIBLE_DEVICES=0`). Otherwise, one may encounter unexpected errors.
+> [!NOTE]
+> The above experiments should be run on a single GPU (i.e. `export CUDA_VISIBLE_DEVICES=0`). Otherwise, one may encounter unexpected errors.
 
 **Example command for ZeRO-2:**
 ```bash
@@ -104,6 +104,6 @@ trainer = YourTrainerClass(
 ```
 
 ### Todo List
-[] Support ZeRO-3 training
-[] Support PPO
-[] Support Verl's RL algorithms
+- [ ] Support ZeRO-3 training
+- [ ] Support PPO
+- [ ] Support Verl's RL algorithms
