@@ -1,3 +1,10 @@
+<!-- ![](figures/maximum_seqlen.png)
+**Maximum sequence length in a single A800-80GB GPU** -->
+
+![](figures/bp_memory.png)
+<!-- **Peak Backpropagation memory cost** -->
+
+# StreamBP
 Code for [StreamBP: Memory-Efficient Exact Backpropagation for Long Sequence Training of LLMs](https://arxiv.org/abs/2506.03077).
 
 StreamBP substantially reduces the memory cost of activation values and scales up the maximum sequence length by 2.8-5.5 $\times$ larger than gradient checkpointing, while using similar or even less BP time.
@@ -5,10 +12,6 @@ StreamBP substantially reduces the memory cost of activation values and scales u
 > [!NOTE]
 > This codebase is under active development; feel free to raise any issues you encountered. We are also accepting feature requests.
 
-![](figures/bp_memory.png)
-**Peak Backpropagation memory cost**
-![](figures/maximum_seqlen.png)
-**Maximum sequence length in a single A800-80GB GPU**
 
 ### Table of Contents
 - [Features](#features)
