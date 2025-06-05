@@ -5,6 +5,11 @@ StreamBP substantially reduces the memory cost of activation values and scales u
 > [!NOTE]
 > This codebase is under active development; feel free to raise any issues you encountered. We are also accepting feature requests.
 
+![](figures/bp_memory.png)
+**Peak Backpropagation memory cost**
+![](figures/maximum_seqlen.png)
+**Maximum sequence length in a single A800-80GB GPU**
+
 ### Table of Contents
 - [Features](#features)
 - [Setup](#setup)
