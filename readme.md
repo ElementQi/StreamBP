@@ -13,9 +13,9 @@ StreamBP substantially reduces the memory cost of activation values and scales u
 - [Todo List](#todo-list)
 
 ### Features
-* **Verified model class**: Qwen-2.5/3, Llama-3/3.1/3.2, Gemma.
+* **Verified model classes**: Qwen-2.5/3, Llama-3/3.1/3.2, Gemma.
 * **Various objectives**: SFT, GRPO, DPO.
-* **Distributed training**: Deepspeed ZeRO stage 1 & 2.
+* **Distributed training support**: Deepspeed ZeRO stage 1 & 2.
 > [!NOTE]
 > The code is applicable to general transformer model classes and is not restricted to the aforementioned model classes. However, due to different architecture design (e.g. normalization), the current implementation may induce incorrect gradient computation. We are actively testing and incoporating different model classes.
 
