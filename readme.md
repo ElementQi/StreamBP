@@ -2,7 +2,8 @@ Code for [StreamBP: Memory-Efficient Exact Backpropagation for Long Sequence Tra
 
 StreamBP substantially reduces the memory cost of activation values and scales up the maximum sequence length by 2.8-5.5 $\times$ larger than gradient checkpointing, while using similar or even less BP time.
 
-**Note:** This codebase is under active development; feel free to raise any issues you encountered. We are also accepting feature requests.
+> [!NOTE]
+> This codebase is under active development; feel free to raise any issues you encountered. We are also accepting feature requests.
 
 ### Table of Contents
 - [Features](#features)
@@ -55,8 +56,7 @@ python scripts/test_dpo.py --mode base --seq_len 15000 --model_name Qwen/Qwen3-8
 python scripts/test_grpo.py --mode stream --seq_len 15000 --chunk_size 5000 --model_name Qwen/Qwen3-8B # StreamBP
 python scripts/test_grpo.py --mode base --seq_len 15000 --model_name Qwen/Qwen3-8B # Gradient checkpointing
 ```
-> [!NOTE]
-> The above experiments should be run on a single GPU (i.e. `export CUDA_VISIBLE_DEVICES=0`). Otherwise, one may encounter unexpected errors.
+**Note:** The above experiments should be run on a single GPU (i.e. `export CUDA_VISIBLE_DEVICES=0`). Otherwise, one may encounter unexpected errors.
 
 **Example command for ZeRO-2:**
 ```bash
