@@ -5,8 +5,8 @@ import time
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--chunk_size", type=int, default=3000)
-parser.add_argument("--seq_len", type=int, default=9000)
+parser.add_argument("--chunk_size", type=int, default=5000)
+parser.add_argument("--seq_len", type=int, default=15000)
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--mode", type=str, default="stream")
 parser.add_argument("--iterations", type=int, default=1)

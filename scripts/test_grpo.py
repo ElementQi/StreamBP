@@ -56,7 +56,7 @@ parser.add_argument("--mode", type=str, default="stream")
 parser.add_argument("--max_completion_len", type=int, default=8000, help="Sequence length for the completion")
 parser.add_argument("--prompt_len", type=int, default=1000, help="Sequence length for the prompt")
 parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples to generate")
-parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B", help="Model to use for training")
+parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Model to use for training")
 parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
 args = parser.parse_args()
 
