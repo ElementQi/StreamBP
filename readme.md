@@ -13,7 +13,7 @@ StreamBP substantially reduces the memory cost of activation values and scales u
 - [Todo List](#todo-list)
 
 ### Features
-* **Verified model class**: Qwen-2.5/3, Llama-3/3.1/3.2, Phi-3/4, Gemma.
+* **Verified model class**: Qwen-2.5/3, Llama-3/3.1/3.2, Gemma.
 * **Various objectives**: SFT, GRPO, DPO.
 * **Distributed training**: Deepspeed ZeRO stage 1 & 2.
 > [!NOTE]
