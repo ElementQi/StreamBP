@@ -100,7 +100,8 @@ model = StreamModel(
     model=model,
     logits_chunk_size=100, # Partition size of logits
     stream_checkpoint=True, # If it's False, only the logits will be partitioned
-    checkpoint_chunk_size=2000 # Suggested value: sequence_len/3
+    checkpoint_chunk_size=2000, # Suggested value: sequence_len/3
+    gradient_accumulation_steps=1 # Set this to match your trainer's args
     )
 
 # other parts remain unchanged
