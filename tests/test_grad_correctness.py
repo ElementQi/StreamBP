@@ -68,10 +68,10 @@ class ModelSetup:
     def create_stream_model(self, base_model: AutoModelForCausalLM):
         # Conditionally import StreamModel based on model type
         if isinstance(base_model, Gemma3ForCausalLM):
-            from streambp.stream_model_gemma import StreamModel
+            from streambp import StreamModelForGemma as StreamModel
         else:
             # For Qwen3ForCausalLM, Qwen2ForCausalLM, LlamaForCausalLM and others
-            from streambp.stream_model import StreamModel
+            from streambp import StreamModel
 
         return StreamModel(
             base_model,

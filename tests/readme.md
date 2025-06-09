@@ -2,29 +2,35 @@
 
 ## For testing BP correctness and peak memory usage
 
-1. Activate your conda environment (replace with your environment name)
+1. Install pytest (if you want to use this feature)
 
     ```bash
-    conda activate ${CONDA_ENV:-streambp}
+    pip install pytest
     ```
 
-2. Navigate to StreamBP directory
+2. Activate your conda environment (replace with your environment name)
+
+    ```bash
+    conda activate streambp
+    ```
+
+3. Navigate to StreamBP directory
 
     ```bash
     cd /path/to/your/StreamBP
     ```
 
-3. Set up Python path and CUDA configuration
+4. Set up CUDA configuration
 
     ```bash
-    export PYTHONPATH=.
-    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-    export CUDA_VISIBLE_DEVICES=${GPU_DEVICE:-0}
+    # optional, most of the time reduces peak memory usage
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 
+    export CUDA_VISIBLE_DEVICES=0
     ```
 
-4. Run tests
+5. Run tests
 
     ```bash
-    # change the model name inside this file
+    # change the model name inside this file to test different models
     pytest tests/test_grad_correctness.py -s -v
     ```
