@@ -608,11 +608,12 @@ class StreamModel(torch.nn.Module):
             del logits_chunk
             loss += loss_chunk.detach()
 
-        # normalize loss and gradient
+
         batch_valid_posnum = (labels != -100).sum().item()
-        loss.div_(batch_valid_posnum)
-        # detached_hidden_states.grad.div_(batch_valid_posnum)
-        # model.lm_head.weight.grad.div_(batch_valid_posnum)
+        # this means gradient accumulation is enabled
+        num_items_in_batch = kwargs.get("num_items_in_batch", batch_valid_posnum)
+        # normalize loss and gradient
+        loss.div_(num_items_in_batch * self.gradient_accumulation_steps)
 
         # with torch.amp.autocast(device_type="cuda", enabled=False):
         #     # If enabled, gradient of bf16 operator related weights will not be computed.
@@ -622,15 +623,23 @@ class StreamModel(torch.nn.Module):
         
         detached_hidden_states.grad = None
 
-        self._cur_gradient_accumulation_step += 1
+        # self._cur_gradient_accumulation_step += 1
+        # self._valid_pos_num += batch_valid_posnum
+        # if self._cur_gradient_accumulation_step == self.gradient_accumulation_steps:
+        #     for param in self.parameters():
+        #         if param.grad is not None:
+        #             param.grad.div_(self._valid_pos_num)
+        #     self._cur_gradient_accumulation_step = 0
+        #     self._valid_pos_num = 0
+
         self._valid_pos_num += batch_valid_posnum
-        if self._cur_gradient_accumulation_step == self.gradient_accumulation_steps:
+        if self._valid_pos_num == num_items_in_batch:
             for param in self.parameters():
                 if param.grad is not None:
-                    param.grad.div_(self._valid_pos_num)
-            self._cur_gradient_accumulation_step = 0
+                    param.grad.div_(num_items_in_batch * self.gradient_accumulation_steps)
+            # self._cur_gradient_accumulation_step = 0
             self._valid_pos_num = 0
-
+        
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
