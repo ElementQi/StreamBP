@@ -21,18 +21,21 @@ StreamBP substantially reduces the memory cost of activation values and scales u
 - [Todo List](#todo-list)
 
 ### Features
-* **Verified model classes**: Qwen-2.5/3, Llama-3/3.1/3.2, Gemma.
+* **Verified model classes**: Qwen-2.5/3, Llama-3/3.1/3.2, Gemma3.
 * **Various objectives**: SFT, GRPO, DPO.
 * **Distributed training support**: Deepspeed ZeRO stage 1 & 2.
 > [!NOTE]
 > The code is applicable to general transformer model classes and is not restricted to the aforementioned model classes. However, due to different architecture design (e.g. normalization), the current implementation may induce incorrect gradient computation. We are actively testing and incoporating different model classes.
 
 ### Setup
-Setup the environment by the following commands:
-```
+Setup the environment from source by the following commands:
+```bash
 conda create -n streambp python=3.10
 conda activate streambp
-pip install streambp
+
+git clone https://github.com/Ledzy/StreamBP.git
+cd StreamBP
+pip install -e .
 pip install -r requirements.txt
 ```
 > [!NOTE]
@@ -93,7 +96,7 @@ class YourTrainerClass(...):
 **Step 2: Wrap model.** Wrap your model as follows:
 
 ```python
-from streambp import StreamModel # NOTE: For Gemma models, use StreamModelForGemma
+from streambp import StreamModel # NOTE: For Gemma3 models, use StreamModelForGemma
 
 # wrap your model with StreamModel
 model = StreamModel(
