@@ -568,6 +568,7 @@ class StreamModel(torch.nn.Module):
         )
         hidden_states = outputs[0]
         B, T, C = hidden_states.size()
+        batch_size = input_ids.size(0) if input_ids is not None else inputs_embeds.size(0)
 
         loss = torch.tensor(0., device=hidden_states.device)
         num_chunks = math.ceil(T / self.logits_chunk_size)
@@ -585,7 +586,7 @@ class StreamModel(torch.nn.Module):
             labels_chunk = labels[:, start:end]
 
             # TODO: check correctness
-            chunk_valid_posnum = (labels_chunk != -100).sum().item() - 1 # -1 for the last token
+            chunk_valid_posnum = (labels_chunk != -100).sum().item() - batch_size # remove the last token per batch
 
             if chunk_valid_posnum <= 0:
                 continue
