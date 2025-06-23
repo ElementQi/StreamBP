@@ -8,6 +8,7 @@ from transformers.processing_utils import Unpack
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaRMSNorm, repeat_kv, rotate_half
 from transformers.utils import LossKwargs
+from contextlib import contextmanager
 import inspect
 import math
 import torch
@@ -391,10 +392,11 @@ class StreamAttention(torch.nn.Module):
 
         return causal_mask
 
-class StreamModel(torch.nn.Module):
+class StreamModel(PreTrainedModel):
     def __init__(self, model: PreTrainedModel, gradient_accumulation_steps, gradient_accumulation_mode="sum", logits_chunk_size: int=500, stream_checkpoint: bool=True, checkpoint_chunk_size: int=500):
         """ The StreamModel class wraps the original model to save the memory usage. """
-        super().__init__()
+        torch.nn.Module.__init__(self)
+        self.supports_gradient_checkpointing = True # hack for enabling gradient checkpointing
         self.logits_chunk_size = logits_chunk_size
         self.stream_checkpoint = stream_checkpoint
         self.checkpoint_chunk_size = checkpoint_chunk_size
@@ -448,6 +450,48 @@ class StreamModel(torch.nn.Module):
                     is_base_model = True
                     break
         return model
+
+    @contextmanager
+    def original_model_context(self):
+        """Context manager to temporarily restore original model structure"""
+        # Store current stream layers and their attention modules
+        original_stream_layers = []
+        original_stream_attentions = []
+
+        for i, stream_layer in enumerate(self.model.model.layers):
+            original_stream_layers.append(stream_layer)
+            # Store the StreamAttention wrapper
+            original_stream_attentions.append(stream_layer.base_layer.self_attn)
+
+            # Restore the original attention module
+            stream_layer.base_layer.self_attn = stream_layer.base_layer.self_attn.self_attn
+            # Restore the original layer
+            self.model.model.layers[i] = stream_layer.base_layer
+
+        try:
+            yield self.model
+        finally:
+            # Restore stream layers and attention modules
+            for i, (stream_layer, stream_attention) in enumerate(zip(original_stream_layers, original_stream_attentions)):
+                # First restore the StreamAttention wrapper
+                stream_layer.base_layer.self_attn = stream_attention
+                # Then restore the StreamDecoderLayer wrapper
+                self.model.model.layers[i] = stream_layer
+
+    def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
+        """Override state_dict to return the original model structure"""
+        with self.original_model_context() as original_model:
+            return original_model.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Override load_state_dict to load into the original model structure"""
+        with self.original_model_context() as original_model:
+            return original_model.load_state_dict(state_dict, strict=strict, assign=assign)
+
+    def save_pretrained(self, save_directory, **kwargs):
+        """Override save_pretrained to save with original model structure"""
+        with self.original_model_context() as original_model:
+            return original_model.save_pretrained(save_directory, **kwargs)
 
     def __getattr__(self, name):
         """inherit attributes from model"""
